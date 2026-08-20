@@ -11,13 +11,25 @@ from auth0_verifier import Auth0TokenVerifier
 from fub_client import FUBClient
 
 
-PUBLIC_BASE = os.environ["MCP_PUBLIC_URL"].rstrip("/")
+def _public_base() -> str:
+    value = os.getenv("MCP_PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if not value:
+        raise RuntimeError("Set MCP_PUBLIC_URL or deploy on Render so RENDER_EXTERNAL_URL is available.")
+    return value.rstrip("/")
+
+
+PUBLIC_BASE = _public_base()
 AUTH0_DOMAIN = os.environ["AUTH0_DOMAIN"].strip().rstrip("/")
 if not AUTH0_DOMAIN.startswith("http"):
     AUTH0_DOMAIN = f"https://{AUTH0_DOMAIN}"
 
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "10000"))
+
 mcp = FastMCP(
     "Blaise FUB Read-Only",
+    host=HOST,
+    port=PORT,
     stateless_http=True,
     json_response=True,
     instructions=(
@@ -89,9 +101,7 @@ async def get_active_deals(person_id: int) -> dict[str, Any]:
 
 
 def main() -> None:
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    mcp.run(transport="streamable-http", host=host, port=port)
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
