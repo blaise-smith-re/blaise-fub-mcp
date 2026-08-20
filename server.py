@@ -35,7 +35,8 @@ mcp = FastMCP(
     instructions=(
         "Read-only access to Blaise Smith's Follow Up Boss account. "
         "Never infer that a write occurred. Never expose credentials. "
-        "Target exact records before returning CRM facts."
+        "Target exact records before returning CRM facts. "
+        "API-visible activity is incomplete by design; never equate missing API data with no activity."
     ),
     token_verifier=Auth0TokenVerifier(),
     auth=AuthSettings(
@@ -80,6 +81,43 @@ async def get_contact(person_id: int) -> dict[str, Any]:
 async def get_contact_events(person_id: int, limit: int = 50, next_token: str | None = None) -> dict[str, Any]:
     """Retrieve API-visible FUB events for one exact person ID. Read-only."""
     return await _client().get_events(person_id, limit=limit, next_token=next_token)
+
+
+
+@mcp.tool()
+async def get_contact_notes(person_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """Retrieve API-visible FUB notes for one exact person ID. Read-only.
+
+    Some UI-visible notes can be restricted from API access by FUB.
+    """
+    return await _client().get_notes(person_id, limit=limit, offset=offset)
+
+
+@mcp.tool()
+async def get_contact_calls(person_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """Retrieve API-visible calls for one exact person ID. Read-only.
+
+    Some UI-visible call data can be restricted from API access by FUB.
+    """
+    return await _client().get_calls(person_id, limit=limit, offset=offset)
+
+
+@mcp.tool()
+async def get_contact_text_messages(person_id: int) -> dict[str, Any]:
+    """Retrieve API-visible text messages for one exact person ID. Read-only.
+
+    Some UI-visible text-message data can be restricted from API access by FUB.
+    """
+    return await _client().get_text_messages(person_id)
+
+
+@mcp.tool()
+async def get_contact_appointments(person_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """Retrieve API-visible FUB appointments for one exact person ID. Read-only.
+
+    FUB-created/synchronized appointment visibility is subject to documented API restrictions.
+    """
+    return await _client().get_appointments(person_id, limit=limit, offset=offset)
 
 
 @mcp.tool()

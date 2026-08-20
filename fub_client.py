@@ -75,6 +75,57 @@ class FUBClient:
             params["next"] = next_token
         return await self._get("/events", params=params)
 
+
+    async def get_notes(self, person_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Retrieve API-visible notes for one person.
+
+        FUB may restrict some notes from API access even when they are visible in the UI.
+        """
+        return await self._get(
+            "/notes",
+            params={
+                "personId": person_id,
+                "limit": min(max(limit, 1), 100),
+                "offset": max(offset, 0),
+            },
+        )
+
+    async def get_calls(self, person_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Retrieve API-visible calls for one person.
+
+        FUB documents that some call data is visible only inside the FUB application.
+        """
+        return await self._get(
+            "/calls",
+            params={
+                "personId": person_id,
+                "limit": min(max(limit, 1), 100),
+                "offset": max(offset, 0),
+            },
+        )
+
+    async def get_text_messages(self, person_id: int) -> dict[str, Any]:
+        """Retrieve API-visible text messages for one person.
+
+        FUB documents that some text-message data is visible only inside the FUB application.
+        """
+        return await self._get("/textMessages", params={"personId": person_id})
+
+    async def get_appointments(self, person_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Retrieve API-visible FUB-created appointments for one person.
+
+        FUB documents restrictions around appointment ownership, calendar sharing, and
+        appointments synced from third-party calendars.
+        """
+        return await self._get(
+            "/appointments",
+            params={
+                "personId": person_id,
+                "limit": min(max(limit, 1), 100),
+                "offset": max(offset, 0),
+            },
+        )
+
     async def get_open_tasks(self, person_id: int) -> dict[str, Any]:
         return await self._get("/tasks", params={"personId": person_id, "isCompleted": "false"})
 
