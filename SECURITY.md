@@ -1,21 +1,12 @@
-# Security controls
+# Security / Operating Controls
 
-## FUB upstream secrets
-- FUB_API_KEY: server-side secret only.
-- FUB_X_SYSTEM_KEY: server-side secret only.
-- Never log Authorization headers or secret values.
-
-## MCP boundary
-- Remote MCP access requires an OAuth Bearer token.
-- Tokens are validated against the configured Auth0 issuer and the exact MCP resource audience.
-- `fub:read` is required for every MCP call.
-- The public MCP endpoint must never be deployed without the OAuth verifier enabled.
-
-## Read-only v2
-No FUB create/update/delete tool exists.
-
-## Exact targeting
-Record-specific reads require an explicit numeric person ID. Search returns a small result set first.
-
-## No false completion
-The connector must never claim a FUB write occurred because v2 contains no write tool.
+- Never commit FUB or Auth0 secrets to GitHub.
+- Exact person/task/deal/appointment targeting is required before write.
+- Prefer preview (`execute=false`) before novel or consequential writes.
+- No delete tools are exposed.
+- No global shared FUB structure-management tools are exposed.
+- Shared tag changes require explicit confirmation that Brent/team approval exists.
+- Appointment invitations can cause email/SMS side effects and require explicit send authorization.
+- `log_external_call_record` and `log_external_text_record` only log externally completed activity.
+- Contact email/phone updates overwrite the entire FUB list; the tool requires expected-current-state matching.
+- Missing API-visible activity does not prove no activity occurred in FUB UI or another system.
