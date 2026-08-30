@@ -4,13 +4,23 @@ import os
 import re
 from typing import Any
 
-from pydantic import AnyHttpUrl
-from mcp.server.auth.settings import AuthSettings
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from pydantic import AnyHttpUrl
 
 from auth0_verifier import Auth0TokenVerifier
+from closeout import (
+    diff_person_snapshot,
+    find_duplicate_note,
+    find_exact_duplicate_task,
+    find_unexpected_task_changes,
+    is_vague_task_name,
+    summarize_recent_notes,
+)
+from daily_control import find_gaps
 from fub_client import FUBClient
+from redaction import assert_no_sensitive_data, redact_for_log
 
 
 def _public_base() -> str:
@@ -65,31 +75,28 @@ def _require_write_scope() -> None:
 def _person_name(person: dict[str, Any]) -> str:
     if person.get("name"):
         return str(person["name"])
-    return " ".join(
-        p for p in [person.get("firstName"), person.get("lastName")] if p
-    ).strip()
+    return " ".join(p for p in [person.get("firstName"), person.get("lastName")] if p).strip()
 
 
 def _assert_person(person: dict[str, Any], person_id: int, expected_name: str) -> None:
-    if int(person.get("id")) != person_id:
+    actual_id = person.get("id")
+    if actual_id is None or int(actual_id) != person_id:
         raise ValueError("Exact person ID check failed.")
     actual = _person_name(person)
     if actual.casefold().strip() != expected_name.casefold().strip():
-        raise ValueError(
-            f"Exact contact-name check failed: record is '{actual}', not '{expected_name}'."
-        )
+        raise ValueError(f"Exact contact-name check failed: record is '{actual}', not '{expected_name}'.")
 
 
 def _assert_task(task: dict[str, Any], task_id: int, person_id: int, expected_name: str) -> None:
-    if int(task.get("id")) != task_id:
+    actual_task_id = task.get("id")
+    if actual_task_id is None or int(actual_task_id) != task_id:
         raise ValueError("Exact task ID check failed.")
-    if int(task.get("personId")) != person_id:
+    actual_person_id = task.get("personId")
+    if actual_person_id is None or int(actual_person_id) != person_id:
         raise ValueError("Task belongs to a different contact.")
     current_name = str(task.get("name") or "")
     if current_name.casefold().strip() != expected_name.casefold().strip():
-        raise ValueError(
-            f"Stale task check failed: current task name is '{current_name}'."
-        )
+        raise ValueError(f"Stale task check failed: current task name is '{current_name}'.")
 
 
 def _validate_tz(value: str | None, label: str = "date-time") -> None:
@@ -98,14 +105,202 @@ def _validate_tz(value: str | None, label: str = "date-time") -> None:
 
 
 def _normalized_values(items: list[dict[str, Any]] | None) -> list[str]:
-    return sorted(
-        str(item.get("value", "")).strip().casefold()
-        for item in (items or [])
-        if item.get("value")
+    return sorted(str(item.get("value", "")).strip().casefold() for item in (items or []) if item.get("value"))
+
+
+def _list_items(response: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    """Unwrap a FUB list response defensively (primary key, then generic 'data')."""
+    return list(response.get(key) or response.get("data") or [])
+
+
+def _truncation_note(response: dict[str, Any], items: list[dict[str, Any]], label: str) -> str | None:
+    """Disclose when a list response was capped, so silence isn't read as completeness.
+
+    A duplicate check that only saw part of the record is a weaker guarantee
+    than one that saw all of it, and the caller is entitled to know which of
+    the two it got.
+    """
+    total = (response.get("_metadata") or {}).get("total")
+    if isinstance(total, int) and total > len(items):
+        return (
+            f"Only the {len(items)} most recent of {total} {label} were read; "
+            "duplicate detection covered that window only."
+        )
+    return None
+
+
+def _write_outcome(write_result: dict[str, Any]) -> dict[str, Any]:
+    """Summarize what a write actually did, without overstating it.
+
+    Distinguishes an object this call created (even when its read-back later
+    failed — the caller still needs that id to reconcile by hand) from a
+    pre-existing object an idempotent retry matched and deliberately did not
+    rewrite. Collapsing those two into one "created" id would misreport a
+    no-op as a write.
+    """
+    status = write_result.get("status")
+    created_id = None
+    for key in ("verified", "created"):
+        section = write_result.get(key)
+        if isinstance(section, dict) and section.get("id") is not None:
+            created_id = section["id"]
+            break
+    matched_id = None
+    for key in ("existing_note", "existing_task"):
+        section = write_result.get(key)
+        if isinstance(section, dict) and section.get("id") is not None:
+            matched_id = section["id"]
+            break
+
+    if status == "NOT_REQUESTED":
+        outcome = "not_requested"
+    elif status == "SKIPPED_EXACT_DUPLICATE_EXISTS":
+        outcome = "matched_existing_no_write"
+    elif created_id is not None:
+        outcome = "created"
+    else:
+        outcome = "not_written"
+
+    return {
+        "id": created_id,
+        "verified": status == "WRITE_COMPLETED_AND_RE_READ",
+        "outcome": outcome,
+        "matched_existing_id": matched_id,
+    }
+
+
+def _require_meaningful_text(value: str, field_label: str) -> None:
+    """Reject empty/whitespace-only content for a field that must carry meaning.
+
+    Without this an empty note or task name writes successfully and every
+    downstream check passes ("" == ""), producing a fully verified report for
+    a record that documents nothing.
+    """
+    if not value or not value.strip():
+        raise ValueError(f"{field_label} cannot be empty or whitespace only.")
+
+
+def _task_summaries(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": t.get("id"),
+            "name": t.get("name"),
+            "type": t.get("type"),
+            "due": t.get("dueDate") or t.get("dueDateTime"),
+        }
+        for t in tasks
+    ]
+
+
+ALLOWED_TASK_TYPES = {
+    "Follow Up",
+    "Call",
+    "Text",
+    "Email",
+    "Appointment",
+    "Showing",
+    "Closing",
+    "Open House",
+    "Thank You",
+}
+
+
+async def _write_note_with_verification(
+    client: FUBClient, person_id: int, subject: str, body: str, existing_notes: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Create a note, then independently re-read it to confirm the write.
+
+    There is no confirmed single-item GET /notes/{id} endpoint reachable from
+    this environment (see docs/CONNECTOR_AUDIT.md), so read-back is done by
+    re-listing the contact's notes and matching on the id the create call
+    returned. If that match fails or the content differs, the write is
+    reported as unverified/mismatched rather than as a confirmed success.
+    """
+    duplicate = find_duplicate_note(existing_notes, subject=subject, body=body)
+    if duplicate is not None:
+        return {"status": "SKIPPED_EXACT_DUPLICATE_EXISTS", "existing_note": duplicate}
+
+    created = await client.create_note(person_id, subject, body)
+
+    note_id = created.get("id")
+    if note_id is None:
+        return {
+            "status": "WRITE_COMPLETED_UNVERIFIED",
+            "created": created,
+            "hold": "Create response had no id; independent read-back was not possible.",
+        }
+    try:
+        after_notes = _list_items(await client.get_notes(person_id, limit=50), "notes")
+    except Exception as exc:  # noqa: BLE001 - the write already happened; report, don't crash
+        return {
+            "status": "WRITE_COMPLETED_UNVERIFIED",
+            "created": created,
+            "hold": f"Note was created (id={note_id}) but independent read-back failed: {redact_for_log(str(exc))}",
+        }
+    verified = next((n for n in after_notes if str(n.get("id")) == str(note_id)), None)
+    if verified is None:
+        return {
+            "status": "WRITE_COMPLETED_UNVERIFIED",
+            "created": created,
+            "hold": "Independent read-back could not find the created note by id.",
+        }
+    if str(verified.get("subject") or "") != subject or str(verified.get("body") or "") != body:
+        return {
+            "status": "WRITE_COMPLETED_CONTENT_MISMATCH",
+            "created": created,
+            "verified": verified,
+            "hold": "Read-back content does not match what was requested.",
+        }
+    return {"status": "WRITE_COMPLETED_AND_RE_READ", "created": created, "verified": verified}
+
+
+async def _write_task_with_dedup_and_verification(
+    client: FUBClient, payload: dict[str, Any], open_tasks: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Create a task unless an exact duplicate is already open; always read back."""
+    duplicate = find_exact_duplicate_task(
+        open_tasks,
+        name=str(payload["name"]),
+        task_type=str(payload["type"]),
+        due_date=payload.get("dueDate"),
+        due_date_time=payload.get("dueDateTime"),
     )
+    if duplicate is not None:
+        return {"status": "SKIPPED_EXACT_DUPLICATE_EXISTS", "existing_task": duplicate}
+
+    created = await client.create_task(payload)
+    task_id = created.get("id")
+    if task_id is None:
+        return {
+            "status": "WRITE_COMPLETED_UNVERIFIED",
+            "created": created,
+            "hold": "Create response had no id; independent read-back was not possible.",
+        }
+    try:
+        verified = await client.get_task(int(task_id))
+    except Exception as exc:  # noqa: BLE001 - the write already happened; report, don't crash
+        return {
+            "status": "WRITE_COMPLETED_UNVERIFIED",
+            "created": created,
+            "hold": f"Task was created (id={task_id}) but independent read-back failed: {redact_for_log(str(exc))}",
+        }
+    mismatches = {
+        field: {"requested": payload[field], "verified": verified.get(field)}
+        for field in ("name", "type", "dueDate", "dueDateTime")
+        if field in payload and str(verified.get(field) or "") != str(payload.get(field) or "")
+    }
+    if mismatches:
+        return {
+            "status": "WRITE_COMPLETED_CONTENT_MISMATCH",
+            "created": created,
+            "verified": verified,
+            "hold": f"Read-back content does not match what was requested: {sorted(mismatches.keys())}.",
+        }
+    return {"status": "WRITE_COMPLETED_AND_RE_READ", "created": created, "verified": verified}
 
 
 # ==================== READ TOOLS ====================
+
 
 @mcp.tool()
 async def find_contact(
@@ -118,8 +313,12 @@ async def find_contact(
 ) -> dict[str, Any]:
     """Search contacts. Read-only."""
     return await _client().find_people(
-        email=email, phone=phone, name=name, stage=stage,
-        assignedUserId=assigned_user_id, limit=limit,
+        email=email,
+        phone=phone,
+        name=name,
+        stage=stage,
+        assignedUserId=assigned_user_id,
+        limit=limit,
     )
 
 
@@ -178,9 +377,7 @@ async def get_task(task_id: int) -> dict[str, Any]:
 
 @mcp.tool()
 async def get_contact_appointments(person_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-    return await _client().search_appointments(
-        personId=person_id, limit=min(max(limit, 1), 100), offset=max(offset, 0)
-    )
+    return await _client().search_appointments(personId=person_id, limit=min(max(limit, 1), 100), offset=max(offset, 0))
 
 
 @mcp.tool()
@@ -194,7 +391,9 @@ async def get_active_deals(person_id: int) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def search_deals(person_id: int | None = None, user_id: int | None = None, status: str | None = None) -> dict[str, Any]:
+async def search_deals(
+    person_id: int | None = None, user_id: int | None = None, status: str | None = None
+) -> dict[str, Any]:
     return await _client().search_deals(personId=person_id, userId=user_id, status=status)
 
 
@@ -250,6 +449,7 @@ async def get_appointment_outcomes() -> dict[str, Any]:
 
 # ==================== WRITE TOOLS ====================
 
+
 @mcp.tool()
 async def create_contact_note(
     person_id: int,
@@ -258,15 +458,39 @@ async def create_contact_note(
     body: str,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Preview/create a plain-text note on an exact contact."""
-    person = await _client().get_person(person_id)
+    """Preview/create a plain-text note on an exact contact.
+
+    Rejects notes containing apparent secrets (passwords, SSNs, account/wire
+    details, TrustFunds secret words). Skips the write if an exact-duplicate
+    note already exists (idempotent retry safe). Every live write is
+    independently re-read via GET /notes to confirm it before being reported
+    as completed.
+    """
+    assert_no_sensitive_data(subject, body, field_label="note")
+    _require_meaningful_text(subject, "Note subject")
+    _require_meaningful_text(body, "Note body")
+    client = _client()
+    person = await client.get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
+    notes_response = await client.get_notes(person_id, limit=50)
+    existing_notes = _list_items(notes_response, "notes")
+    dedup_scope_note = _truncation_note(notes_response, existing_notes, "notes")
     preview = {"personId": person_id, "name": _person_name(person), "subject": subject, "body": body}
+
+    duplicate = find_duplicate_note(existing_notes, subject=subject, body=body)
+    scope: dict[str, Any] = {"dedup_scope_limitation": dedup_scope_note} if dedup_scope_note else {}
+    if duplicate is not None:
+        return {
+            "status": "SKIPPED_EXACT_DUPLICATE_EXISTS",
+            "preview": preview,
+            "existing_note": duplicate,
+            **scope,
+        }
     if not execute:
-        return {"status": "PREVIEW_ONLY_NO_WRITE", "preview": preview}
+        return {"status": "PREVIEW_ONLY_NO_WRITE", "preview": preview, **scope}
     _require_write_scope()
-    created = await _client().create_note(person_id, subject, body)
-    return {"status": "WRITE_COMPLETED", "created": created}
+    result = await _write_note_with_verification(client, person_id, subject, body, existing_notes)
+    return {**result, "preview": preview, **scope}
 
 
 @mcp.tool()
@@ -281,16 +505,29 @@ async def create_contact_task(
     remind_seconds_before: int | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Preview/create one task. Exactly one due_date or due_date_time is required."""
-    allowed = {"Follow Up","Call","Text","Email","Appointment","Showing","Closing","Open House","Thank You"}
-    if task_type not in allowed:
+    """Preview/create one task. Exactly one due_date or due_date_time is required.
+
+    Skips the write if an exact-duplicate open task (same name, type, and due
+    date) already exists on this contact (idempotent retry safe). Rejects a
+    bare placeholder name (e.g. just "Follow Up" or "Call") in favor of a
+    task that names the actual next commitment.
+    """
+    assert_no_sensitive_data(name, field_label="task name")
+    if is_vague_task_name(name):
+        raise ValueError(
+            f"Task name {name!r} is a bare placeholder, not a next commitment. "
+            "Name the actual next step, e.g. 'Call to confirm inspection date' "
+            "instead of 'Call' or 'Follow Up'."
+        )
+    if task_type not in ALLOWED_TASK_TYPES:
         raise ValueError(f"Unsupported task type: {task_type}")
     if bool(due_date) == bool(due_date_time):
         raise ValueError("Provide exactly one of due_date or due_date_time.")
     _validate_tz(due_date_time, "due_date_time")
-    person = await _client().get_person(person_id)
+    client = _client()
+    person = await client.get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
-    await _client().get_user(assigned_user_id)
+    await client.get_user(assigned_user_id)
     payload: dict[str, Any] = {
         "personId": person_id,
         "assignedUserId": assigned_user_id,
@@ -304,14 +541,18 @@ async def create_contact_task(
         payload["dueDateTime"] = due_date_time
     if remind_seconds_before is not None:
         payload["remindSecondsBefore"] = remind_seconds_before
+
+    open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
+    duplicate = find_exact_duplicate_task(
+        open_tasks, name=name, task_type=task_type, due_date=due_date, due_date_time=due_date_time
+    )
+    if duplicate is not None:
+        return {"status": "SKIPPED_EXACT_DUPLICATE_EXISTS", "preview": payload, "existing_task": duplicate}
     if not execute:
         return {"status": "PREVIEW_ONLY_NO_WRITE", "preview": payload}
     _require_write_scope()
-    created = await _client().create_task(payload)
-    if created.get("id"):
-        verified = await _client().get_task(int(created["id"]))
-        return {"status": "WRITE_COMPLETED_AND_RE_READ", "created": created, "verified": verified}
-    return {"status": "WRITE_COMPLETED", "created": created}
+    result = await _write_task_with_dedup_and_verification(client, payload, open_tasks)
+    return {**result, "preview": payload}
 
 
 @mcp.tool()
@@ -327,17 +568,23 @@ async def update_contact_task(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/update one exact task. No reassignment or deletion."""
+    assert_no_sensitive_data(new_name, field_label="task name")
     task = await _client().get_task(task_id)
     _assert_task(task, task_id, expected_person_id, expected_task_name)
     if new_due_date and new_due_date_time:
         raise ValueError("Use only one due date field.")
     _validate_tz(new_due_date_time, "new_due_date_time")
     payload: dict[str, Any] = {}
-    if new_name is not None: payload["name"] = new_name
-    if new_task_type is not None: payload["type"] = new_task_type
-    if new_due_date is not None: payload["dueDate"] = new_due_date
-    if new_due_date_time is not None: payload["dueDateTime"] = new_due_date_time
-    if mark_completed is not None: payload["isCompleted"] = mark_completed
+    if new_name is not None:
+        payload["name"] = new_name
+    if new_task_type is not None:
+        payload["type"] = new_task_type
+    if new_due_date is not None:
+        payload["dueDate"] = new_due_date
+    if new_due_date_time is not None:
+        payload["dueDateTime"] = new_due_date_time
+    if mark_completed is not None:
+        payload["isCompleted"] = mark_completed
     if not payload:
         raise ValueError("No task changes supplied.")
     if not execute:
@@ -365,21 +612,22 @@ async def update_contact_profile(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/update selected contact fields. Moves only to an existing stage; never edits stage definitions."""
+    assert_no_sensitive_data(new_first_name, new_last_name, background, field_label="contact profile")
     before = await _client().get_person(person_id)
     _assert_person(before, person_id, expected_contact_name)
     payload: dict[str, Any] = {}
-    if new_first_name is not None: payload["firstName"] = new_first_name
-    if new_last_name is not None: payload["lastName"] = new_last_name
+    if new_first_name is not None:
+        payload["firstName"] = new_first_name
+    if new_last_name is not None:
+        payload["lastName"] = new_last_name
     if existing_stage_name is not None:
         stages = await _client().get_stages()
-        names = {
-            str(x.get("name")) for x in (stages.get("stages") or stages.get("data") or [])
-            if x.get("name")
-        }
+        names = {str(x.get("name")) for x in (stages.get("stages") or stages.get("data") or []) if x.get("name")}
         if existing_stage_name not in names:
             raise ValueError("Stage must already exist in FUB. Shared stage creation is not exposed.")
         payload["stage"] = existing_stage_name
-    if price is not None: payload["price"] = price
+    if price is not None:
+        payload["price"] = price
     if timeframe_id is not None:
         await _client().get_timeframes()
         payload["timeframeId"] = timeframe_id
@@ -389,12 +637,15 @@ async def update_contact_profile(
     if assigned_lender_id is not None:
         await _client().get_user(assigned_lender_id)
         payload["assignedLenderId"] = assigned_lender_id
-    if assigned_lender_name is not None: payload["assignedLenderName"] = assigned_lender_name
-    if background is not None: payload["background"] = background
+    if assigned_lender_name is not None:
+        payload["assignedLenderName"] = assigned_lender_name
+    if background is not None:
+        payload["background"] = background
     if custom_fields:
         definitions = await _client().get_custom_fields()
         valid = {
-            str(x.get("name")) for x in (definitions.get("customFields") or definitions.get("data") or [])
+            str(x.get("name"))
+            for x in (definitions.get("customFields") or definitions.get("data") or [])
             if x.get("name")
         }
         invalid = [k for k in custom_fields if k not in valid or not k.startswith("custom")]
@@ -496,7 +747,9 @@ async def create_contact_appointment(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/create an FUB appointment. Invitation sending requires explicit authorization."""
-    _validate_tz(start, "start"); _validate_tz(end, "end")
+    assert_no_sensitive_data(title, location, description, field_label="appointment")
+    _validate_tz(start, "start")
+    _validate_tz(end, "end")
     person = await _client().get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
     user = await _client().get_user(assigned_user_id)
@@ -504,12 +757,19 @@ async def create_contact_appointment(
         raise PermissionError("Sending an appointment invitation requires explicit authorization.")
     invitees = [
         {"userId": assigned_user_id, "name": str(user.get("name") or "")},
-        {"personId": person_id, "name": _person_name(person), "email": ((person.get("emails") or [{}])[0].get("value"))},
+        {
+            "personId": person_id,
+            "name": _person_name(person),
+            "email": ((person.get("emails") or [{}])[0].get("value")),
+        },
     ]
     payload: dict[str, Any] = {"title": title, "invitees": invitees, "allDay": False, "start": start, "end": end}
-    if location is not None: payload["location"] = location
-    if description is not None: payload["description"] = description
-    if type_id is not None: payload["typeId"] = type_id
+    if location is not None:
+        payload["location"] = location
+    if description is not None:
+        payload["description"] = description
+    if type_id is not None:
+        payload["typeId"] = type_id
     if not execute:
         return {"status": "PREVIEW_ONLY_NO_WRITE", "payload": payload, "sendInvitation": send_invitation}
     _require_write_scope()
@@ -537,6 +797,7 @@ async def update_contact_appointment(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/update one appointment using a fresh read of the current record."""
+    assert_no_sensitive_data(new_title, new_location, new_description, field_label="appointment")
     current = await _client().get_appointment(appointment_id)
     if str(current.get("title") or "").casefold().strip() != expected_title.casefold().strip():
         raise ValueError("Stale appointment title check failed.")
@@ -548,7 +809,8 @@ async def update_contact_appointment(
         raise PermissionError("Sending an appointment invitation requires explicit authorization.")
     start = new_start or current.get("start")
     end = new_end or current.get("end")
-    _validate_tz(start, "start"); _validate_tz(end, "end")
+    _validate_tz(start, "start")
+    _validate_tz(end, "end")
     payload = {
         "title": new_title or current.get("title"),
         "invitees": invitees,
@@ -591,6 +853,7 @@ async def create_contact_deal(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/create a deal for an exact contact. No empty userIds allowed."""
+    assert_no_sensitive_data(deal_name, description, field_label="deal")
     person = await _client().get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
     if not user_ids:
@@ -599,17 +862,23 @@ async def create_contact_deal(
         await _client().get_user(uid)
     payload: dict[str, Any] = {"name": deal_name, "stageId": stage_id, "peopleIds": [person_id], "userIds": user_ids}
     for k, v in {
-        "description": description, "price": price, "projectedCloseDate": projected_close_date,
-        "mutualAcceptanceDate": mutual_acceptance_date, "earnestMoneyDueDate": earnest_money_due_date,
-        "dueDiligenceDate": due_diligence_date, "finalWalkThroughDate": final_walk_through_date,
+        "description": description,
+        "price": price,
+        "projectedCloseDate": projected_close_date,
+        "mutualAcceptanceDate": mutual_acceptance_date,
+        "earnestMoneyDueDate": earnest_money_due_date,
+        "dueDiligenceDate": due_diligence_date,
+        "finalWalkThroughDate": final_walk_through_date,
         "possessionDate": possession_date,
     }.items():
-        if v is not None: payload[k] = v
+        if v is not None:
+            payload[k] = v
     if custom_fields:
         defs = await _client().get_deal_custom_fields()
         valid = {str(x.get("name")) for x in (defs.get("dealCustomFields") or defs.get("data") or []) if x.get("name")}
         bad = [k for k in custom_fields if k not in valid]
-        if bad: raise ValueError(f"Unknown deal custom field(s): {bad}")
+        if bad:
+            raise ValueError(f"Unknown deal custom field(s): {bad}")
         payload.update(custom_fields)
     if not execute:
         return {"status": "PREVIEW_ONLY_NO_WRITE", "payload": payload}
@@ -640,6 +909,7 @@ async def update_contact_deal(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/update one exact deal. No delete/archive tool is exposed."""
+    assert_no_sensitive_data(new_name, description, field_label="deal")
     before = await _client().get_deal(deal_id)
     if str(before.get("name") or "").casefold().strip() != expected_deal_name.casefold().strip():
         raise ValueError("Stale deal-name check failed.")
@@ -647,13 +917,21 @@ async def update_contact_deal(
         raise ValueError("Deal is not linked to the expected contact.")
     payload: dict[str, Any] = {}
     for k, v in {
-        "name": new_name, "stageId": stage_id, "description": description, "price": price,
-        "projectedCloseDate": projected_close_date, "mutualAcceptanceDate": mutual_acceptance_date,
-        "earnestMoneyDueDate": earnest_money_due_date, "dueDiligenceDate": due_diligence_date,
-        "finalWalkThroughDate": final_walk_through_date, "possessionDate": possession_date,
+        "name": new_name,
+        "stageId": stage_id,
+        "description": description,
+        "price": price,
+        "projectedCloseDate": projected_close_date,
+        "mutualAcceptanceDate": mutual_acceptance_date,
+        "earnestMoneyDueDate": earnest_money_due_date,
+        "dueDiligenceDate": due_diligence_date,
+        "finalWalkThroughDate": final_walk_through_date,
+        "possessionDate": possession_date,
     }.items():
-        if v is not None: payload[k] = v
-    if custom_fields: payload.update(custom_fields)
+        if v is not None:
+            payload[k] = v
+    if custom_fields:
+        payload.update(custom_fields)
     if not payload:
         raise ValueError("No deal changes supplied.")
     if not execute:
@@ -676,13 +954,19 @@ async def log_external_call_record(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Record an externally made/received call in FUB. DOES NOT place a call."""
+    assert_no_sensitive_data(outcome, note, field_label="call log")
     person = await _client().get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
     payload: dict[str, Any] = {
-        "personId": person_id, "phone": phone, "isIncoming": is_incoming, "duration": duration_seconds
+        "personId": person_id,
+        "phone": phone,
+        "isIncoming": is_incoming,
+        "duration": duration_seconds,
     }
-    if outcome is not None: payload["outcome"] = outcome
-    if note is not None: payload["note"] = note
+    if outcome is not None:
+        payload["outcome"] = outcome
+    if note is not None:
+        payload["note"] = note
     if not execute:
         return {"status": "PREVIEW_ONLY_NO_WRITE", "IMPORTANT": "LOG ONLY — DOES NOT PLACE CALL", "payload": payload}
     _require_write_scope()
@@ -702,17 +986,325 @@ async def log_external_text_record(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Record an externally sent/received text in FUB. DOES NOT send a text."""
+    assert_no_sensitive_data(message, field_label="text log")
     person = await _client().get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
     payload = {
-        "personId": person_id, "message": message, "toNumber": to_number, "fromNumber": from_number,
-        "isIncoming": is_incoming, "externalLabel": external_label,
+        "personId": person_id,
+        "message": message,
+        "toNumber": to_number,
+        "fromNumber": from_number,
+        "isIncoming": is_incoming,
+        "externalLabel": external_label,
     }
     if not execute:
         return {"status": "PREVIEW_ONLY_NO_WRITE", "IMPORTANT": "LOG ONLY — DOES NOT SEND TEXT", "payload": payload}
     _require_write_scope()
     created = await _client().log_text_message(payload)
     return {"status": "WRITE_COMPLETED", "IMPORTANT": "LOG ONLY — NO TEXT WAS SENT", "created": created}
+
+
+# ==================== DAILY CONTROL AUDIT (read-only) ====================
+
+
+async def _audit_contact_daily_control(
+    person_id: int,
+    expected_contact_name: str,
+    expected_assigned_user_id: int | None,
+    stale_note_days: int,
+) -> dict[str, Any]:
+    client = _client()
+    person = await client.get_person(person_id)
+    _assert_person(person, person_id, expected_contact_name)
+    open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
+    notes_response = await client.get_notes(person_id, limit=50)
+    notes = _list_items(notes_response, "notes")
+    notes_scope_note = _truncation_note(notes_response, notes, "notes")
+    events = _list_items(await client.get_events(person_id, limit=50), "events")
+    findings = find_gaps(
+        person=person,
+        open_tasks=open_tasks,
+        notes=notes,
+        events=events,
+        expected_assigned_user_id=expected_assigned_user_id,
+        stale_note_days=stale_note_days,
+    )
+    return {
+        "status": "AUDIT_COMPLETE",
+        "personId": person_id,
+        "name": _person_name(person),
+        "assignedUserId": person.get("assignedUserId"),
+        "findings": findings,
+        "evidence_scope": {
+            "open_tasks_checked": len(open_tasks),
+            "notes_checked": len(notes),
+            "events_checked": len(events),
+            "notes_scope_limitation": notes_scope_note,
+        },
+        "caveats": [
+            "Findings reflect only what the FUB API returned at read time.",
+            "Absence of API-visible communication, events, or notes is not proof that no interaction occurred.",
+            "An empty findings list means no gap was detected by these specific checks at "
+            "their configured thresholds; it is not a certification that the record is complete.",
+            "Threshold-based findings are advisory implementation defaults, not Follow Up Boss business policy.",
+        ],
+    }
+
+
+@mcp.tool()
+async def audit_contact_daily_control(
+    person_id: int,
+    expected_contact_name: str,
+    expected_assigned_user_id: int | None = None,
+    stale_note_days: int = 21,
+) -> dict[str, Any]:
+    """Read-only control-gap audit for one specifically authorized contact.
+
+    Checks: no future task, overdue tasks, exact-duplicate open tasks,
+    same-day conflicting next actions, no sufficiently recent interaction
+    note, and (when expected_assigned_user_id is supplied) ownership
+    mismatch. Every finding includes the evidence it was derived from. This
+    tool makes no writes and never treats missing API activity as proof that
+    no activity occurred.
+    """
+    return await _audit_contact_daily_control(
+        person_id, expected_contact_name, expected_assigned_user_id, stale_note_days
+    )
+
+
+@mcp.tool()
+async def audit_contacts_daily_control_batch(
+    contacts: list[dict[str, Any]],
+    stale_note_days: int = 21,
+) -> dict[str, Any]:
+    """Run the daily-control audit over an explicit, caller-authorized contact list.
+
+    Each entry in `contacts` must provide person_id and expected_contact_name;
+    expected_assigned_user_id is optional per entry. This never enumerates or
+    scans the account on its own — only the exact records passed in are read.
+    """
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for entry in contacts:
+        try:
+            person_id = int(entry["person_id"])
+            expected_contact_name = str(entry["expected_contact_name"])
+            expected_assigned_user_id = entry.get("expected_assigned_user_id")
+            results.append(
+                await _audit_contact_daily_control(
+                    person_id, expected_contact_name, expected_assigned_user_id, stale_note_days
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad entry must not abort the batch
+            errors.append({"input": entry, "error": str(exc)})
+    return {"status": "BATCH_AUDIT_COMPLETE", "results": results, "errors": errors}
+
+
+# ==================== SAFE INTERACTION CLOSEOUT ====================
+
+
+@mcp.tool()
+async def close_out_contact_interaction(
+    person_id: int,
+    expected_contact_name: str,
+    expected_assigned_user_id: int,
+    note_subject: str,
+    note_body: str,
+    create_next_task: bool = False,
+    next_task_name: str | None = None,
+    next_task_type: str | None = None,
+    next_task_due_date: str | None = None,
+    next_task_due_date_time: str | None = None,
+    next_task_remind_seconds_before: int | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Preview/execute a safe FUB interaction closeout: one note + at most one task.
+
+    Defaults to PREVIEW_ONLY_NO_WRITE. On execute=True: verifies the exact
+    contact and current owner, skips a note or task that already exists as an
+    exact duplicate, creates the requested note and (if asked) exactly one
+    dated next task, independently re-reads every write, diffs the contact
+    and its other open tasks before vs. after, and reports any change outside
+    what was requested as unresolved rather than silently accepting it.
+    """
+    assert_no_sensitive_data(note_subject, note_body, next_task_name, field_label="closeout content")
+    _require_meaningful_text(note_subject, "Note subject")
+    _require_meaningful_text(note_body, "Note body")
+
+    if create_next_task:
+        if not next_task_name or not next_task_type:
+            raise ValueError("next_task_name and next_task_type are required when create_next_task=True.")
+        if is_vague_task_name(next_task_name):
+            raise ValueError(
+                f"next_task_name {next_task_name!r} is a bare placeholder, not a next commitment. "
+                "Name the actual next step, e.g. 'Call to confirm inspection date' instead of "
+                "'Call' or 'Follow Up'."
+            )
+        if next_task_type not in ALLOWED_TASK_TYPES:
+            raise ValueError(f"Unsupported task type: {next_task_type}")
+        if bool(next_task_due_date) == bool(next_task_due_date_time):
+            raise ValueError("Provide exactly one of next_task_due_date or next_task_due_date_time.")
+        _validate_tz(next_task_due_date_time, "next_task_due_date_time")
+
+    client = _client()
+    before_person = await client.get_person(person_id)
+    _assert_person(before_person, person_id, expected_contact_name)
+
+    actual_owner = before_person.get("assignedUserId")
+    if actual_owner is None or int(actual_owner) != int(expected_assigned_user_id):
+        raise ValueError(
+            f"Owner verification failed: contact {person_id} is assigned to user "
+            f"{actual_owner!r}, expected {expected_assigned_user_id}. Refusing to "
+            "close out with an unverified owner."
+        )
+
+    before_open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
+    notes_response = await client.get_notes(person_id, limit=50)
+    existing_notes = _list_items(notes_response, "notes")
+    dedup_scope_note = _truncation_note(notes_response, existing_notes, "notes")
+
+    note_duplicate = find_duplicate_note(existing_notes, subject=note_subject, body=note_body)
+    task_payload: dict[str, Any] | None = None
+    task_duplicate: dict[str, Any] | None = None
+    if create_next_task:
+        task_payload = {
+            "personId": person_id,
+            "assignedUserId": expected_assigned_user_id,
+            "name": next_task_name,
+            "type": next_task_type,
+            "isCompleted": False,
+        }
+        if next_task_due_date:
+            task_payload["dueDate"] = next_task_due_date
+        if next_task_due_date_time:
+            task_payload["dueDateTime"] = next_task_due_date_time
+        if next_task_remind_seconds_before is not None:
+            task_payload["remindSecondsBefore"] = next_task_remind_seconds_before
+        task_duplicate = find_exact_duplicate_task(
+            before_open_tasks,
+            name=next_task_name,  # type: ignore[arg-type]
+            task_type=next_task_type,  # type: ignore[arg-type]
+            due_date=next_task_due_date,
+            due_date_time=next_task_due_date_time,
+        )
+
+    # Relationship-context surfaced for human review only — never written back
+    # to FUB. Helps confirm the new note doesn't contradict recent history and
+    # that a real next commitment exists rather than the record going stale.
+    context = {
+        "recent_notes": summarize_recent_notes(existing_notes),
+        "open_tasks_before": _task_summaries(before_open_tasks),
+        "dedup_scope_limitation": dedup_scope_note,
+    }
+    next_commitment_advisory: str | None = None
+    if not create_next_task and not before_open_tasks:
+        next_commitment_advisory = (
+            "No open task exists and this closeout does not create one — the contact will have "
+            "no dated next action after this write. Consider create_next_task=True."
+        )
+
+    preview = {
+        "personId": person_id,
+        "name": _person_name(before_person),
+        "assignedUserId": actual_owner,
+        "context": context,
+        "next_commitment_advisory": next_commitment_advisory,
+        "note": {
+            "subject": note_subject,
+            "body": note_body,
+            "would_skip_as_duplicate": note_duplicate is not None,
+        },
+        "task": (
+            {**task_payload, "would_skip_as_duplicate": task_duplicate is not None}
+            if task_payload is not None
+            else {"status": "NOT_REQUESTED"}
+        ),
+    }
+
+    if not execute:
+        return {"status": "PREVIEW_ONLY_NO_WRITE", "preview": preview}
+
+    _require_write_scope()
+
+    unresolved: list[str] = []
+
+    try:
+        note_result = await _write_note_with_verification(client, person_id, note_subject, note_body, existing_notes)
+    except Exception as exc:  # noqa: BLE001 - report the partial state, never lose it to a crash
+        note_result = {"status": "WRITE_FAILED", "error": redact_for_log(str(exc))}
+
+    task_result: dict[str, Any] = {"status": "NOT_REQUESTED"}
+    if task_payload is not None:
+        try:
+            task_result = await _write_task_with_dedup_and_verification(client, task_payload, before_open_tasks)
+        except Exception as exc:  # noqa: BLE001 - report the partial state, never lose it to a crash
+            task_result = {"status": "WRITE_FAILED", "error": redact_for_log(str(exc))}
+
+    try:
+        after_person = await client.get_person(person_id)
+        after_open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
+    except Exception as exc:  # noqa: BLE001
+        after_person = before_person
+        after_open_tasks = before_open_tasks
+        unresolved.append(
+            f"Could not independently confirm final contact/task state after writing: {redact_for_log(str(exc))}"
+        )
+
+    # Resolve created object ids from ANY status that actually wrote something.
+    # Restricting this to the fully-verified status loses the id in exactly the
+    # case where a human most needs it: the object was created but read-back
+    # failed, so it must be reconciled by hand.
+    task_outcome = _write_outcome(task_result)
+    created_task_id = task_outcome["id"]
+    task_id_verified = task_outcome["verified"]
+    # A task this call created is never an "unexpected" new task, even when its
+    # read-back failed — otherwise the report accuses itself of an unrelated change.
+    allowed_new_task_ids: frozenset[Any] = frozenset({created_task_id}) if created_task_id is not None else frozenset()
+
+    person_diff = diff_person_snapshot(before_person, after_person)
+    unrelated_task_changes = find_unexpected_task_changes(
+        before_open_tasks, after_open_tasks, allowed_new_task_ids=allowed_new_task_ids
+    )
+
+    note_outcome = _write_outcome(note_result)
+    created_note_id = note_outcome["id"]
+    note_id_verified = note_outcome["verified"]
+
+    ok_statuses = {"WRITE_COMPLETED_AND_RE_READ", "SKIPPED_EXACT_DUPLICATE_EXISTS", "NOT_REQUESTED"}
+    if note_result.get("status") not in ok_statuses:
+        unresolved.append(f"Note write not fully verified: {note_result.get('status')}.")
+    if task_result.get("status") not in ok_statuses:
+        unresolved.append(f"Task write not fully verified: {task_result.get('status')}.")
+    if person_diff:
+        unresolved.append(f"Unexpected contact field change(s) detected: {sorted(person_diff.keys())}.")
+    if unrelated_task_changes:
+        unresolved.append("Unexpected change(s) detected on pre-existing open tasks.")
+
+    return {
+        "status": "CLOSEOUT_COMPLETED" if not unresolved else "CLOSEOUT_COMPLETED_WITH_HOLD",
+        "personId": person_id,
+        "name": _person_name(after_person),
+        "note": note_result,
+        "task": task_result,
+        "dedup_scope_limitation": dedup_scope_note,
+        "before_after": {
+            "person_field_changes": person_diff,
+            "unrelated_open_task_changes": unrelated_task_changes,
+            "open_task_count_before": len(before_open_tasks),
+            "open_task_count_after": len(after_open_tasks),
+        },
+        "created_object_ids": {
+            "note_id": created_note_id,
+            "note_id_verified": note_id_verified,
+            "note_outcome": note_outcome["outcome"],
+            "note_matched_existing_id": note_outcome["matched_existing_id"],
+            "task_id": created_task_id,
+            "task_id_verified": task_id_verified,
+            "task_outcome": task_outcome["outcome"],
+            "task_matched_existing_id": task_outcome["matched_existing_id"],
+        },
+        "unresolved": unresolved,
+    }
 
 
 def main() -> None:

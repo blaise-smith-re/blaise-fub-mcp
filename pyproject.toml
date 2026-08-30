@@ -1,6 +1,10 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "blaise-fub-mcp"
-version = "5.0.0"
+version = "5.1.0"
 description = "Private Follow Up Boss MCP operator for Blaise Smith"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,3 +13,35 @@ dependencies = [
   "pydantic>=2.0",
   "PyJWT[crypto]>=2.8",
 ]
+
+[tool.setuptools]
+py-modules = ["server", "fub_client", "auth0_verifier", "closeout", "daily_control", "redaction"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# E701 (multi-statement lines) matches this codebase's established compact
+# `if x is not None: payload[k] = v` style used throughout the pre-existing
+# write tools; not worth a mechanical rewrite of untouched code for this pass.
+ignore = ["E701"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true

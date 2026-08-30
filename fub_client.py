@@ -49,14 +49,10 @@ class FUBClient:
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return await self._request("GET", path, params=params)
 
-    async def _post(
-        self, path: str, body: dict[str, Any], params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    async def _post(self, path: str, body: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
         return await self._request("POST", path, params=params, json_body=body)
 
-    async def _put(
-        self, path: str, body: dict[str, Any], params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    async def _put(self, path: str, body: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
         return await self._request("PUT", path, params=params, json_body=body)
 
     # ---------- people ----------
@@ -77,9 +73,7 @@ class FUBClient:
     async def get_person(self, person_id: int) -> dict[str, Any]:
         return await self._get(f"/people/{person_id}", params={"fields": "allFields"})
 
-    async def update_person(
-        self, person_id: int, body: dict[str, Any], *, merge_tags: bool = False
-    ) -> dict[str, Any]:
+    async def update_person(self, person_id: int, body: dict[str, Any], *, merge_tags: bool = False) -> dict[str, Any]:
         return await self._put(
             f"/people/{person_id}",
             body,

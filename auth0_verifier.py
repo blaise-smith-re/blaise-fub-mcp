@@ -5,7 +5,6 @@ from typing import Any
 
 import jwt
 from jwt import PyJWKClient
-
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
 
