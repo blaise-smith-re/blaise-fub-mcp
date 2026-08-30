@@ -119,6 +119,82 @@ class FUBClient:
         clean = {k: v for k, v in params.items() if v is not None}
         return await self._get("/tasks", params=clean)
 
+    async def search_tasks_all(
+        self,
+        *,
+        page_size: int = 100,
+        max_items: int = 1000,
+        max_pages: int = 50,
+        **params: Any,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Page through /tasks until the complete matching set is retrieved.
+
+        A single-page `search_tasks` call relies on whatever default limit
+        FUB applies when none is given — verified in production to silently
+        return fewer tasks than the account actually has (FUB 06 v1.6: 21 of
+        22 reported open tasks, no pagination parameter exposed). This method
+        exists specifically so nothing downstream has to trust that default.
+
+        Loops on limit/offset, tracks FUB's own `_metadata.total` when
+        present, and de-duplicates by task id (defensive against a page
+        overlap if the underlying set mutates mid-scan). Bounded by
+        `max_items` and `max_pages` so an unexpectedly huge result set fails
+        safely — capped and disclosed — rather than looping unbounded.
+
+        Returns (tasks, completeness) where completeness reports
+        returned_count, total_count (None if FUB didn't disclose one),
+        has_more, capped, and pages_fetched.
+        """
+        clean = {k: v for k, v in params.items() if v is not None}
+        limit = min(max(int(page_size), 1), 100)
+        offset = 0
+        collected: list[dict[str, Any]] = []
+        seen_ids: set[Any] = set()
+        total: int | None = None
+        pages = 0
+        capped = False
+
+        while True:
+            response = await self.search_tasks(**clean, limit=limit, offset=offset)
+            page_items = list(response.get("tasks") or response.get("data") or [])
+            meta = response.get("_metadata") or {}
+            if isinstance(meta.get("total"), int):
+                total = meta["total"]
+            pages += 1
+
+            new_this_page = 0
+            for task in page_items:
+                key = task.get("id")
+                dedup_key = key if key is not None else id(task)
+                if dedup_key in seen_ids:
+                    continue
+                seen_ids.add(dedup_key)
+                collected.append(task)
+                new_this_page += 1
+
+            if len(collected) >= max_items:
+                capped = True
+                break
+            if not page_items or len(page_items) < limit:
+                break
+            if new_this_page == 0:
+                # A full page with nothing new: stop rather than loop forever
+                # against a misbehaving or shifting result set.
+                break
+            if pages >= max_pages:
+                capped = True
+                break
+            offset += limit
+
+        completeness = {
+            "returned_count": len(collected),
+            "total_count": total,
+            "has_more": bool(capped or (isinstance(total, int) and total > len(collected))),
+            "capped": capped,
+            "pages_fetched": pages,
+        }
+        return collected, completeness
+
     async def get_task(self, task_id: int) -> dict[str, Any]:
         return await self._get(f"/tasks/{task_id}")
 

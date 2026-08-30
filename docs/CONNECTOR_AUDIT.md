@@ -29,8 +29,8 @@ call, not independently certified but low-risk).
 | get_contact_notes | `get_notes` → `GET /notes?personId=` | CERTIFIED | n/a — also reused below as the note **read-back** mechanism |
 | get_contact_calls | `get_calls` → `GET /calls?personId=` | CERTIFIED | n/a |
 | get_contact_text_messages | `get_text_messages` → `GET /textMessages?personId=` | CERTIFIED, with FUB06 caveat: zero results ≠ no communication (Inbox App Messages / API-restricted history not exposed) | n/a |
-| search_tasks | `search_tasks` → `GET /tasks` | CERTIFIED | n/a |
-| get_open_tasks | `search_tasks(isCompleted=False)` | CERTIFIED (basis of the one live write test) | n/a |
+| search_tasks | `search_tasks` / `search_tasks_all` → `GET /tasks` | **NOT CERTIFIED as of FUB 06 v1.6** — production defect verified Aug 30 2026: `due=today` missed a real due-today task, `due`/date-keyword inputs could be silently ignored, and the tool returned 21 of 22 reported open tasks with no pagination parameter. Hardened this pass — see `docs/TASK_RETRIEVAL_HARDENING.md`; re-certification pending. | n/a |
+| get_open_tasks | `search_tasks_all(isCompleted=False)` | Hardened this pass to always retrieve the complete set (was previously a single unpaginated page — the same defect as `search_tasks`). Re-certification pending. | n/a |
 | get_task | `get_task` → `GET /tasks/{id}` | CERTIFIED (used as task read-back) | n/a |
 | get_contact_appointments, get_appointment | `search_appointments` / `get_appointment` | UNCERTIFIED | n/a |
 | get_active_deals, search_deals, get_deal | `search_deals` / `get_deal` | UNCERTIFIED | n/a |

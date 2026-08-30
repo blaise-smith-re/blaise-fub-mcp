@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["server", "fub_client", "auth0_verifier", "closeout", "daily_control", "redaction"]
+py-modules = ["server", "fub_client", "auth0_verifier", "closeout", "daily_control", "redaction", "task_dates"]
 
 [dependency-groups]
 dev = [

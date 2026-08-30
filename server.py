@@ -21,6 +21,7 @@ from closeout import (
 from daily_control import find_gaps
 from fub_client import FUBClient
 from redaction import assert_no_sensitive_data, redact_for_log
+from task_dates import filter_tasks_by_due_date, parse_calendar_date, resolve_timezone
 
 
 def _public_base() -> str:
@@ -127,6 +128,36 @@ def _truncation_note(response: dict[str, Any], items: list[dict[str, Any]], labe
             "duplicate detection covered that window only."
         )
     return None
+
+
+async def _get_all_open_tasks(client: FUBClient, person_id: int) -> list[dict[str, Any]]:
+    """The complete set of one contact's open tasks — never a possibly-truncated page.
+
+    Single call site for the pattern every duplicate-check and audit path in
+    this file needs. Per-contact open-task counts are always small in
+    practice, so full pagination here is cheap; the alternative (a single
+    unpaginated page) is exactly the production defect verified in FUB 06
+    v1.6 — up to 21 of 22 open tasks silently returned as if it were all of
+    them, with no pagination parameter to catch it.
+    """
+    tasks, _completeness = await client.search_tasks_all(personId=person_id, isCompleted=False)
+    return tasks
+
+
+def _page_completeness(
+    response: dict[str, Any], items: list[dict[str, Any]], *, limit: int, offset: int
+) -> dict[str, Any]:
+    """Completeness metadata for a single (non-paginated) page of results."""
+    total = (response.get("_metadata") or {}).get("total")
+    has_more = isinstance(total, int) and (offset + len(items)) < total
+    return {
+        "returned_count": len(items),
+        "total_count": total if isinstance(total, int) else None,
+        "has_more": bool(has_more),
+        "capped": False,
+        "pages_fetched": 1,
+        "next_offset": (offset + limit) if has_more else None,
+    }
 
 
 def _write_outcome(write_result: dict[str, Any]) -> dict[str, Any]:
@@ -355,19 +386,116 @@ async def search_tasks(
     task_type: str | None = None,
     is_completed: bool | None = None,
     due: str | None = None,
+    due_on: str | None = None,
+    due_from: str | None = None,
+    due_to: str | None = None,
+    due_timezone: str = "America/Chicago",
+    limit: int = 100,
+    offset: int = 0,
+    fetch_all: bool = False,
 ) -> dict[str, Any]:
-    return await _client().search_tasks(
-        personId=person_id,
-        assignedUserId=assigned_user_id,
-        type=task_type,
-        isCompleted=is_completed,
-        due=due,
-    )
+    """Search tasks. Read-only.
+
+    For anything date-sensitive, use due_on (exact calendar date) and/or
+    due_from/due_to (inclusive bounded range, YYYY-MM-DD) instead of the
+    legacy `due` keyword. FUB's own `due=<keyword>` server-side filtering is
+    independently verified unreliable (FUB 06 v1.6, Aug 30 2026: due=today
+    missed a real due-today task; due=tomorrow and specific-date inputs
+    could be silently ignored). `due` is still accepted and passed through
+    for backward compatibility, but a response built from it carries a
+    caveat rather than being trusted silently.
+
+    due_on/due_from/due_to are evaluated client-side, deterministically,
+    against each task's raw due date in due_timezone (default
+    America/Chicago) — by calendar date, not by converting to a UTC instant,
+    so results are correct across a timezone's day boundary. Unsupported
+    date syntax (anything other than exact YYYY-MM-DD) raises a clear error
+    immediately rather than being silently ignored. Using any of these three
+    always retrieves the complete matching set first (see fetch_all below),
+    since a date filter applied to a partial page could silently miss a
+    match sitting on a later page.
+
+    Pagination: set fetch_all=True to retrieve the complete matching set
+    (paged, bounded, and disclosed) instead of one page of up to `limit`
+    starting at `offset`. Every response includes a `_completeness` block
+    (returned_count, total_count when FUB discloses it, has_more, capped,
+    pages_fetched) so a caller can never mistake a partial page for the
+    full result — this was the verified production gap (FUB 06 v1.6): no
+    pagination parameter existed and up to 21 of 22 open tasks were
+    silently returned as if that were the complete set.
+    """
+    tz = resolve_timezone(due_timezone)
+    # `is not None`, not truthiness: an empty string is still "the caller
+    # supplied a value" and must be validated, not silently treated the same
+    # as "no filter requested" — that would reproduce the exact class of
+    # silent-ignore defect this parameter set exists to close.
+    due_on_date = parse_calendar_date(due_on, field_label="due_on") if due_on is not None else None
+    due_from_date = parse_calendar_date(due_from, field_label="due_from") if due_from is not None else None
+    due_to_date = parse_calendar_date(due_to, field_label="due_to") if due_to is not None else None
+    if due_from_date is not None and due_to_date is not None and due_from_date > due_to_date:
+        raise ValueError(f"due_from {due_from!r} is after due_to {due_to!r}.")
+    wants_date_filter = due_on_date is not None or due_from_date is not None or due_to_date is not None
+
+    client = _client()
+    base_params: dict[str, Any] = {
+        "personId": person_id,
+        "assignedUserId": assigned_user_id,
+        "type": task_type,
+        "isCompleted": is_completed,
+        "due": due,
+    }
+
+    # A date filter must never be evaluated against a possibly-partial page —
+    # that would silently miss matches sitting on an unfetched page, which is
+    # the same class of defect this tool exists to close. Force complete
+    # retrieval whenever one is requested, regardless of fetch_all.
+    if fetch_all or wants_date_filter:
+        tasks, completeness = await client.search_tasks_all(**base_params)
+    else:
+        response = await client.search_tasks(**base_params, limit=limit, offset=offset)
+        tasks = _list_items(response, "tasks")
+        completeness = _page_completeness(response, tasks, limit=limit, offset=offset)
+
+    unusable_due = 0
+    if wants_date_filter:
+        tasks, unusable_due = filter_tasks_by_due_date(
+            tasks, due_on=due_on_date, due_from=due_from_date, due_to=due_to_date, tz=tz
+        )
+
+    result: dict[str, Any] = {"tasks": tasks, "_completeness": completeness}
+    if due is not None:
+        result["due_keyword_caveat"] = (
+            "The legacy `due` keyword was passed through to Follow Up Boss as-is; its "
+            "server-side filtering is independently verified unreliable (FUB 06 v1.6). "
+            "Prefer due_on/due_from/due_to for anything date-sensitive."
+        )
+    if wants_date_filter:
+        result["due_date_filter"] = {
+            "due_on": due_on_date.isoformat() if due_on_date else None,
+            "due_from": due_from_date.isoformat() if due_from_date else None,
+            "due_to": due_to_date.isoformat() if due_to_date else None,
+            "timezone": due_timezone,
+            "excluded_no_usable_due_date": unusable_due,
+        }
+    return result
 
 
 @mcp.tool()
 async def get_open_tasks(person_id: int) -> dict[str, Any]:
-    return await _client().search_tasks(personId=person_id, isCompleted=False)
+    """All open (incomplete) tasks for one contact. Always retrieves the complete set.
+
+    Unlike a single unpaginated page (the verified production defect in
+    FUB 06 v1.6, where up to 21 of 22 open tasks were silently returned as
+    if it were the whole set), this pages through the full result and
+    reports `_completeness` so a caller can never mistake a partial result
+    for a complete one.
+    """
+    tasks, completeness = await _client().search_tasks_all(personId=person_id, isCompleted=False)
+    return {
+        "tasks": tasks,
+        "_metadata": {"total": completeness["total_count"]},
+        "_completeness": completeness,
+    }
 
 
 @mcp.tool()
@@ -542,7 +670,7 @@ async def create_contact_task(
     if remind_seconds_before is not None:
         payload["remindSecondsBefore"] = remind_seconds_before
 
-    open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
+    open_tasks = await _get_all_open_tasks(client, person_id)
     duplicate = find_exact_duplicate_task(
         open_tasks, name=name, task_type=task_type, due_date=due_date, due_date_time=due_date_time
     )
@@ -1016,7 +1144,7 @@ async def _audit_contact_daily_control(
     client = _client()
     person = await client.get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
-    open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
+    open_tasks = await _get_all_open_tasks(client, person_id)
     notes_response = await client.get_notes(person_id, limit=50)
     notes = _list_items(notes_response, "notes")
     notes_scope_note = _truncation_note(notes_response, notes, "notes")
@@ -1158,7 +1286,7 @@ async def close_out_contact_interaction(
             "close out with an unverified owner."
         )
 
-    before_open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
+    before_open_tasks = await _get_all_open_tasks(client, person_id)
     notes_response = await client.get_notes(person_id, limit=50)
     existing_notes = _list_items(notes_response, "notes")
     dedup_scope_note = _truncation_note(notes_response, existing_notes, "notes")
@@ -1242,7 +1370,7 @@ async def close_out_contact_interaction(
 
     try:
         after_person = await client.get_person(person_id)
-        after_open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
+        after_open_tasks = await _get_all_open_tasks(client, person_id)
     except Exception as exc:  # noqa: BLE001
         after_person = before_person
         after_open_tasks = before_open_tasks

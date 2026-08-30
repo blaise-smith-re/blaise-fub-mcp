@@ -9,12 +9,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from fub_client import FUBClient
+
 
 class FakeFUBClient:
     def __init__(self) -> None:
         self.people: dict[int, dict[str, Any]] = {}
         self.notes: dict[int, dict[str, Any]] = {}
         self.tasks: dict[int, dict[str, Any]] = {}
+        self._task_order: list[int] = []
         self.users: dict[int, dict[str, Any]] = {}
         self.events: dict[int, list[dict[str, Any]]] = {}
 
@@ -45,6 +48,8 @@ class FakeFUBClient:
 
     def add_task(self, task_id: int, **fields: Any) -> dict[str, Any]:
         task = {"id": task_id, "isCompleted": False, **fields}
+        if task_id not in self.tasks:
+            self._task_order.append(task_id)
         self.tasks[task_id] = task
         return task
 
@@ -85,12 +90,28 @@ class FakeFUBClient:
         return {"id": note_id, "personId": person_id, "subject": subject, "body": body}
 
     async def search_tasks(self, **params: Any) -> dict[str, Any]:
-        tasks = [dict(t) for t in self.tasks.values()]
+        # Insertion order, not dict-hash order, so paging is deterministic and
+        # comparable to a stable real-API ordering across repeated calls.
+        tasks = [dict(self.tasks[k]) for k in self._task_order if k in self.tasks]
         if params.get("personId") is not None:
             tasks = [t for t in tasks if t["personId"] == params["personId"]]
+        if params.get("assignedUserId") is not None:
+            tasks = [t for t in tasks if t.get("assignedUserId") == params["assignedUserId"]]
+        if params.get("type") is not None:
+            tasks = [t for t in tasks if t.get("type") == params["type"]]
         if params.get("isCompleted") is not None:
             tasks = [t for t in tasks if bool(t.get("isCompleted")) == bool(params["isCompleted"])]
-        return {"tasks": tasks}
+        total = len(tasks)
+        offset = int(params.get("offset") or 0)
+        limit = params.get("limit")
+        page = tasks[offset : offset + int(limit)] if limit is not None else tasks[offset:]
+        return {"tasks": page, "_metadata": {"total": total, "offset": offset, "limit": limit}}
+
+    async def search_tasks_all(self, **params: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        # Exercises the real pagination/dedup/cap algorithm against this fake's
+        # own (paginating) search_tasks, rather than reimplementing it, so the
+        # tests cover the actual production logic.
+        return await FUBClient.search_tasks_all(self, **params)  # type: ignore[arg-type]
 
     async def get_task(self, task_id: int) -> dict[str, Any]:
         if self.fail_task_readback:
@@ -111,6 +132,7 @@ class FakeFUBClient:
         task = dict(body)
         task["id"] = task_id
         self.tasks[task_id] = task
+        self._task_order.append(task_id)
         return dict(task)
 
     async def get_user(self, user_id: int) -> dict[str, Any]:
