@@ -101,9 +101,28 @@ _VAGUE_TASK_NAMES: frozenset[str] = frozenset(
 )
 
 
+# Punctuation that only decorates a placeholder ("Follow up.", "*Call*",
+# "(follow up)") and must not disguise it as a specific commitment. Stripped
+# from the outside of the whole name only — internal punctuation is preserved
+# so genuinely specific names ("Follow up re: lender") stay well clear of the
+# blocklist.
+_DECORATIVE_EDGE_CHARS = " \t\r\n.!?:;,-–—_*~\"'`()[]{}<>/\\|"
+
+
 def is_vague_task_name(name: str) -> bool:
-    """True if a task name is a bare placeholder with no commitment content."""
-    normalized = " ".join(name.strip().casefold().split())
+    """True if a task name is a bare placeholder with no commitment content.
+
+    Matching is exact against a narrow blocklist after normalizing case,
+    internal whitespace, and decorative edge punctuation — so a placeholder
+    cannot be smuggled past by appending a period, and a specific name that
+    merely contains a blocklisted word is never rejected.
+    """
+    normalized = " ".join(name.casefold().split()).strip(_DECORATIVE_EDGE_CHARS)
+    normalized = " ".join(normalized.split())
+    if not normalized:
+        # Empty, whitespace-only, or purely decorative names carry no
+        # commitment at all, which is the condition this guard exists for.
+        return True
     return normalized in _VAGUE_TASK_NAMES
 
 

@@ -33,11 +33,38 @@ Tool: `close_out_contact_interaction` (server.py; helpers in `closeout.py`).
    server-controlled touch/activity timestamps; any pre-existing open task
    that changed or disappeared; any new task beyond the one this call
    created.
-8. **Report.** Returns `created_object_ids` (note id, task id — `None` when
-   not created), the full before/after diff, and an `unresolved` list that
-   is empty only when every write succeeded, verified clean, and nothing
-   unrelated changed. Overall `status` is `CLOSEOUT_COMPLETED` only when
-   `unresolved` is empty; otherwise `CLOSEOUT_COMPLETED_WITH_HOLD`.
+8. **Report.** Returns `created_object_ids`, the full before/after diff, and
+   an `unresolved` list that is empty only when every write succeeded,
+   verified clean, and nothing unrelated changed. Overall `status` is
+   `CLOSEOUT_COMPLETED` only when `unresolved` is empty; otherwise
+   `CLOSEOUT_COMPLETED_WITH_HOLD`.
+
+### `created_object_ids` semantics
+
+Each of note and task reports four fields, chosen so the report can never
+overstate or lose what happened:
+
+| Field | Meaning |
+|---|---|
+| `*_id` | Id of an object **this call created**, or `None` |
+| `*_id_verified` | Whether that object was independently re-read and content-matched |
+| `*_outcome` | `created`, `matched_existing_no_write`, `not_written`, or `not_requested` |
+| `*_matched_existing_id` | Id of a pre-existing object an idempotent retry matched |
+
+Two distinctions this encodes deliberately:
+
+- **A created-but-unverified object still reports its id.** If the write
+  succeeded and the read-back then failed, `*_id` is populated with
+  `*_id_verified: false`. Suppressing the id in that case would withhold it
+  in exactly the situation where a human needs it to reconcile by hand.
+- **An idempotent skip is never reported as a creation.** A matched
+  pre-existing record appears under `*_matched_existing_id` with
+  `*_outcome: matched_existing_no_write` and a `None` `*_id`, so a no-op is
+  never mistaken for a write.
+
+A task this call created is also excluded from the "unexpected new task"
+check even when its read-back failed — otherwise the report would accuse
+itself of making an unrelated change.
 
 ## Guardrails specific to this tool
 
@@ -46,7 +73,15 @@ Tool: `close_out_contact_interaction` (server.py; helpers in `closeout.py`).
   actual commitment.
 - **Sensitive-data rejection.** `note_subject`, `note_body`, and
   `next_task_name` are scanned before anything else runs; a match raises
-  before any read or write happens.
+  before any read or write happens. The same guard now runs on **every**
+  free-text write path in the connector (task rename, contact background,
+  appointment title/location/description, deal name/description, and the
+  external call/text activity logs), so the filter cannot be bypassed by
+  routing the same text through a sibling tool.
+- **Empty-content rejection.** Note subject, note body, and task name must
+  contain non-whitespace text. An empty note would otherwise write
+  successfully and pass every downstream check (`"" == ""`), producing a
+  fully "verified" report for a record documenting nothing.
 - **Exactly one note, at most one task, per call.** There is no loop, no
   batch-write path, and no way to pass a list of notes/tasks — this
   structurally guarantees "every intended write appears exactly once" per

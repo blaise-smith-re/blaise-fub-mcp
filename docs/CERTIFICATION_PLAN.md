@@ -1,5 +1,42 @@
 # Live Certification Plan — Daily Control Audit & Safe Closeout
 
+> **Status update (2026-08-30):** Live certification was completed against a
+> PR-preview deployment of this branch using synthetic contact `18513`, with
+> an overall PASS across the audit, note write, task write, combined closeout,
+> and idempotent retry. A subsequent adversarial pre-merge review then found
+> and fixed 9 defect classes; see "Post-certification review findings" below.
+> Those fixes changed observable output (new disclosure fields, stricter
+> input validation), so the affected action classes should be re-exercised
+> once against the preview before merge.
+
+## Post-certification review findings (all fixed on this branch)
+
+| # | Area | Defect | Fix |
+|---|---|---|---|
+| 1 | Stale-note | 21-day threshold not marked as an implementation default; readable as FUB 05 policy | `threshold_basis` + `advisory` fields on every threshold finding |
+| 2 | Stale-note | Truncating day count made the real boundary 22 days, not 21 | Fractional-day comparison; boundary tested at 20.9/21.0/21.1 |
+| 3 | Stale-note | Notes that exist but cannot be dated were reported as "the API returned no notes", contradicting their own evidence count | Distinct summary + `notes_with_unusable_dates`, framed as data quality |
+| 4 | Vague-name | Trailing punctuation bypassed the blocklist ("Follow up." accepted) | Decorative edge-punctuation stripped before matching |
+| 5 | Vague-name | Empty / whitespace-only / punctuation-only task names accepted | Treated as vague; explicit non-empty validation |
+| 6 | Empty writes | Empty note subject/body wrote successfully and "verified" clean (`"" == ""`) | `_require_meaningful_text` on note subject, note body, task name |
+| 7 | Ownership | A contact with **no** assigned user passed the ownership check silently | Unassigned now raises its own `ownership_mismatch` finding |
+| 8 | Partial write | Created object ids were dropped unless read-back succeeded — lost exactly when needed for manual recovery; a created-but-unverified task was also self-reported as an "unexpected new task" | `_write_outcome` reports id + `verified` + `outcome`, distinguishing created from matched-existing |
+| 9 | Filter bypass | Sensitive-data scanning guarded 3 tools; 7 other free-text write paths (task rename, contact background, appointment title/location/description, deal name/description, external call/text logs) reached FUB unscanned | Guard applied to every free-text write path |
+
+## Operational findings — PR-preview vs production
+
+The preview deployment used for certification runs the same `FUB_API_KEY`,
+`X-System`, and `X-System-Key` as production, against the same live FUB
+account. Two consequences worth holding:
+
+1. **Preview writes are indistinguishable from production writes inside FUB.**
+   Both carry `systemId 43` / `Blaise RE – Claude FUB MCP`. Records created
+   during certification are real records in the real account, distinguishable
+   only by their content and the synthetic contact they sit on.
+2. **Two services currently hold write access to the live FUB account.**
+   The preview service should be suspended or deleted once merge is decided;
+   leaving it running is a standing second write path with no ongoing purpose.
+
 This engineering pass is code + docs + tests only. **No live FUB write was
 performed while building it.** The items below are what a human-supervised
 live pass needs to check before these action classes move from

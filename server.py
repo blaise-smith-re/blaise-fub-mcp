@@ -113,6 +113,73 @@ def _list_items(response: dict[str, Any], key: str) -> list[dict[str, Any]]:
     return list(response.get(key) or response.get("data") or [])
 
 
+def _truncation_note(response: dict[str, Any], items: list[dict[str, Any]], label: str) -> str | None:
+    """Disclose when a list response was capped, so silence isn't read as completeness.
+
+    A duplicate check that only saw part of the record is a weaker guarantee
+    than one that saw all of it, and the caller is entitled to know which of
+    the two it got.
+    """
+    total = (response.get("_metadata") or {}).get("total")
+    if isinstance(total, int) and total > len(items):
+        return (
+            f"Only the {len(items)} most recent of {total} {label} were read; "
+            "duplicate detection covered that window only."
+        )
+    return None
+
+
+def _write_outcome(write_result: dict[str, Any]) -> dict[str, Any]:
+    """Summarize what a write actually did, without overstating it.
+
+    Distinguishes an object this call created (even when its read-back later
+    failed — the caller still needs that id to reconcile by hand) from a
+    pre-existing object an idempotent retry matched and deliberately did not
+    rewrite. Collapsing those two into one "created" id would misreport a
+    no-op as a write.
+    """
+    status = write_result.get("status")
+    created_id = None
+    for key in ("verified", "created"):
+        section = write_result.get(key)
+        if isinstance(section, dict) and section.get("id") is not None:
+            created_id = section["id"]
+            break
+    matched_id = None
+    for key in ("existing_note", "existing_task"):
+        section = write_result.get(key)
+        if isinstance(section, dict) and section.get("id") is not None:
+            matched_id = section["id"]
+            break
+
+    if status == "NOT_REQUESTED":
+        outcome = "not_requested"
+    elif status == "SKIPPED_EXACT_DUPLICATE_EXISTS":
+        outcome = "matched_existing_no_write"
+    elif created_id is not None:
+        outcome = "created"
+    else:
+        outcome = "not_written"
+
+    return {
+        "id": created_id,
+        "verified": status == "WRITE_COMPLETED_AND_RE_READ",
+        "outcome": outcome,
+        "matched_existing_id": matched_id,
+    }
+
+
+def _require_meaningful_text(value: str, field_label: str) -> None:
+    """Reject empty/whitespace-only content for a field that must carry meaning.
+
+    Without this an empty note or task name writes successfully and every
+    downstream check passes ("" == ""), producing a fully verified report for
+    a record that documents nothing.
+    """
+    if not value or not value.strip():
+        raise ValueError(f"{field_label} cannot be empty or whitespace only.")
+
+
 def _task_summaries(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -154,6 +221,7 @@ async def _write_note_with_verification(
         return {"status": "SKIPPED_EXACT_DUPLICATE_EXISTS", "existing_note": duplicate}
 
     created = await client.create_note(person_id, subject, body)
+
     note_id = created.get("id")
     if note_id is None:
         return {
@@ -399,20 +467,30 @@ async def create_contact_note(
     as completed.
     """
     assert_no_sensitive_data(subject, body, field_label="note")
+    _require_meaningful_text(subject, "Note subject")
+    _require_meaningful_text(body, "Note body")
     client = _client()
     person = await client.get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
-    existing_notes = _list_items(await client.get_notes(person_id, limit=50), "notes")
+    notes_response = await client.get_notes(person_id, limit=50)
+    existing_notes = _list_items(notes_response, "notes")
+    dedup_scope_note = _truncation_note(notes_response, existing_notes, "notes")
     preview = {"personId": person_id, "name": _person_name(person), "subject": subject, "body": body}
 
     duplicate = find_duplicate_note(existing_notes, subject=subject, body=body)
+    scope: dict[str, Any] = {"dedup_scope_limitation": dedup_scope_note} if dedup_scope_note else {}
     if duplicate is not None:
-        return {"status": "SKIPPED_EXACT_DUPLICATE_EXISTS", "preview": preview, "existing_note": duplicate}
+        return {
+            "status": "SKIPPED_EXACT_DUPLICATE_EXISTS",
+            "preview": preview,
+            "existing_note": duplicate,
+            **scope,
+        }
     if not execute:
-        return {"status": "PREVIEW_ONLY_NO_WRITE", "preview": preview}
+        return {"status": "PREVIEW_ONLY_NO_WRITE", "preview": preview, **scope}
     _require_write_scope()
     result = await _write_note_with_verification(client, person_id, subject, body, existing_notes)
-    return {**result, "preview": preview}
+    return {**result, "preview": preview, **scope}
 
 
 @mcp.tool()
@@ -490,6 +568,7 @@ async def update_contact_task(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/update one exact task. No reassignment or deletion."""
+    assert_no_sensitive_data(new_name, field_label="task name")
     task = await _client().get_task(task_id)
     _assert_task(task, task_id, expected_person_id, expected_task_name)
     if new_due_date and new_due_date_time:
@@ -533,6 +612,7 @@ async def update_contact_profile(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/update selected contact fields. Moves only to an existing stage; never edits stage definitions."""
+    assert_no_sensitive_data(new_first_name, new_last_name, background, field_label="contact profile")
     before = await _client().get_person(person_id)
     _assert_person(before, person_id, expected_contact_name)
     payload: dict[str, Any] = {}
@@ -667,6 +747,7 @@ async def create_contact_appointment(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/create an FUB appointment. Invitation sending requires explicit authorization."""
+    assert_no_sensitive_data(title, location, description, field_label="appointment")
     _validate_tz(start, "start")
     _validate_tz(end, "end")
     person = await _client().get_person(person_id)
@@ -716,6 +797,7 @@ async def update_contact_appointment(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/update one appointment using a fresh read of the current record."""
+    assert_no_sensitive_data(new_title, new_location, new_description, field_label="appointment")
     current = await _client().get_appointment(appointment_id)
     if str(current.get("title") or "").casefold().strip() != expected_title.casefold().strip():
         raise ValueError("Stale appointment title check failed.")
@@ -771,6 +853,7 @@ async def create_contact_deal(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/create a deal for an exact contact. No empty userIds allowed."""
+    assert_no_sensitive_data(deal_name, description, field_label="deal")
     person = await _client().get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
     if not user_ids:
@@ -826,6 +909,7 @@ async def update_contact_deal(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Preview/update one exact deal. No delete/archive tool is exposed."""
+    assert_no_sensitive_data(new_name, description, field_label="deal")
     before = await _client().get_deal(deal_id)
     if str(before.get("name") or "").casefold().strip() != expected_deal_name.casefold().strip():
         raise ValueError("Stale deal-name check failed.")
@@ -870,6 +954,7 @@ async def log_external_call_record(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Record an externally made/received call in FUB. DOES NOT place a call."""
+    assert_no_sensitive_data(outcome, note, field_label="call log")
     person = await _client().get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
     payload: dict[str, Any] = {
@@ -901,6 +986,7 @@ async def log_external_text_record(
     execute: bool = False,
 ) -> dict[str, Any]:
     """Record an externally sent/received text in FUB. DOES NOT send a text."""
+    assert_no_sensitive_data(message, field_label="text log")
     person = await _client().get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
     payload = {
@@ -931,7 +1017,9 @@ async def _audit_contact_daily_control(
     person = await client.get_person(person_id)
     _assert_person(person, person_id, expected_contact_name)
     open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
-    notes = _list_items(await client.get_notes(person_id, limit=50), "notes")
+    notes_response = await client.get_notes(person_id, limit=50)
+    notes = _list_items(notes_response, "notes")
+    notes_scope_note = _truncation_note(notes_response, notes, "notes")
     events = _list_items(await client.get_events(person_id, limit=50), "events")
     findings = find_gaps(
         person=person,
@@ -951,10 +1039,14 @@ async def _audit_contact_daily_control(
             "open_tasks_checked": len(open_tasks),
             "notes_checked": len(notes),
             "events_checked": len(events),
+            "notes_scope_limitation": notes_scope_note,
         },
         "caveats": [
             "Findings reflect only what the FUB API returned at read time.",
             "Absence of API-visible communication, events, or notes is not proof that no interaction occurred.",
+            "An empty findings list means no gap was detected by these specific checks at "
+            "their configured thresholds; it is not a certification that the record is complete.",
+            "Threshold-based findings are advisory implementation defaults, not Follow Up Boss business policy.",
         ],
     }
 
@@ -1036,6 +1128,8 @@ async def close_out_contact_interaction(
     what was requested as unresolved rather than silently accepting it.
     """
     assert_no_sensitive_data(note_subject, note_body, next_task_name, field_label="closeout content")
+    _require_meaningful_text(note_subject, "Note subject")
+    _require_meaningful_text(note_body, "Note body")
 
     if create_next_task:
         if not next_task_name or not next_task_type:
@@ -1065,7 +1159,9 @@ async def close_out_contact_interaction(
         )
 
     before_open_tasks = _list_items(await client.search_tasks(personId=person_id, isCompleted=False), "tasks")
-    existing_notes = _list_items(await client.get_notes(person_id, limit=50), "notes")
+    notes_response = await client.get_notes(person_id, limit=50)
+    existing_notes = _list_items(notes_response, "notes")
+    dedup_scope_note = _truncation_note(notes_response, existing_notes, "notes")
 
     note_duplicate = find_duplicate_note(existing_notes, subject=note_subject, body=note_body)
     task_payload: dict[str, Any] | None = None
@@ -1098,6 +1194,7 @@ async def close_out_contact_interaction(
     context = {
         "recent_notes": summarize_recent_notes(existing_notes),
         "open_tasks_before": _task_summaries(before_open_tasks),
+        "dedup_scope_limitation": dedup_scope_note,
     }
     next_commitment_advisory: str | None = None
     if not create_next_task and not before_open_tasks:
@@ -1153,21 +1250,25 @@ async def close_out_contact_interaction(
             f"Could not independently confirm final contact/task state after writing: {redact_for_log(str(exc))}"
         )
 
-    allowed_new_task_ids: frozenset[Any] = frozenset()
-    created_task_id = None
-    if task_result.get("status") == "WRITE_COMPLETED_AND_RE_READ":
-        created_task_id = task_result.get("verified", {}).get("id") or task_result.get("created", {}).get("id")
-        if created_task_id is not None:
-            allowed_new_task_ids = frozenset({created_task_id})
+    # Resolve created object ids from ANY status that actually wrote something.
+    # Restricting this to the fully-verified status loses the id in exactly the
+    # case where a human most needs it: the object was created but read-back
+    # failed, so it must be reconciled by hand.
+    task_outcome = _write_outcome(task_result)
+    created_task_id = task_outcome["id"]
+    task_id_verified = task_outcome["verified"]
+    # A task this call created is never an "unexpected" new task, even when its
+    # read-back failed — otherwise the report accuses itself of an unrelated change.
+    allowed_new_task_ids: frozenset[Any] = frozenset({created_task_id}) if created_task_id is not None else frozenset()
 
     person_diff = diff_person_snapshot(before_person, after_person)
     unrelated_task_changes = find_unexpected_task_changes(
         before_open_tasks, after_open_tasks, allowed_new_task_ids=allowed_new_task_ids
     )
 
-    created_note_id = None
-    if note_result.get("status") == "WRITE_COMPLETED_AND_RE_READ":
-        created_note_id = note_result.get("verified", {}).get("id") or note_result.get("created", {}).get("id")
+    note_outcome = _write_outcome(note_result)
+    created_note_id = note_outcome["id"]
+    note_id_verified = note_outcome["verified"]
 
     ok_statuses = {"WRITE_COMPLETED_AND_RE_READ", "SKIPPED_EXACT_DUPLICATE_EXISTS", "NOT_REQUESTED"}
     if note_result.get("status") not in ok_statuses:
@@ -1185,13 +1286,23 @@ async def close_out_contact_interaction(
         "name": _person_name(after_person),
         "note": note_result,
         "task": task_result,
+        "dedup_scope_limitation": dedup_scope_note,
         "before_after": {
             "person_field_changes": person_diff,
             "unrelated_open_task_changes": unrelated_task_changes,
             "open_task_count_before": len(before_open_tasks),
             "open_task_count_after": len(after_open_tasks),
         },
-        "created_object_ids": {"note_id": created_note_id, "task_id": created_task_id},
+        "created_object_ids": {
+            "note_id": created_note_id,
+            "note_id_verified": note_id_verified,
+            "note_outcome": note_outcome["outcome"],
+            "note_matched_existing_id": note_outcome["matched_existing_id"],
+            "task_id": created_task_id,
+            "task_id_verified": task_id_verified,
+            "task_outcome": task_outcome["outcome"],
+            "task_matched_existing_id": task_outcome["matched_existing_id"],
+        },
         "unresolved": unresolved,
     }
 

@@ -76,17 +76,38 @@ def _same_day_conflicts(
     return conflicts
 
 
-def _latest_note(notes: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _latest_note(notes: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, int]:
+    """Return (most recent dateable note, count of notes with no usable date).
+
+    The undateable count is returned separately so a contact whose notes exist
+    but cannot be dated is never reported as having no notes at all.
+    """
     best: dict[str, Any] | None = None
     best_dt: datetime | None = None
+    undateable = 0
     for n in notes:
         dt = _parse_dt(n.get("created")) or _parse_dt(n.get("updated")) or _parse_dt(n.get("date"))
         if dt is None:
+            undateable += 1
             continue
         if best_dt is None or dt > best_dt:
             best_dt = dt
             best = {**n, "_parsed_created": dt}
-    return best
+    return best, undateable
+
+
+# The stale-note threshold is an ENGINEERING DEFAULT chosen for this connector.
+# It is not drawn from FUB 05, which defines no note-staleness interval (its
+# only numeric review interval is "Qualify leads older than seven days", a
+# different rule about a different object). Findings derived from it are
+# advisory prompts for human review, never a policy determination.
+STALE_NOTE_THRESHOLD_BASIS = "implementation_default"
+STALE_NOTE_ADVISORY = (
+    "Advisory only. The staleness threshold is an implementation default for this "
+    "connector, not established Follow Up Boss business policy and not a rule "
+    "defined by FUB 05. Adjust stale_note_days per call to match the actual "
+    "operating rhythm for this relationship."
+)
 
 
 def find_gaps(
@@ -162,37 +183,79 @@ def find_gaps(
             }
         )
 
-    latest_note = _latest_note(notes)
+    latest_note, undateable_notes = _latest_note(notes)
     if latest_note is None:
+        if notes:
+            summary = (
+                f"{len(notes)} note(s) were returned but none could be dated, so note recency cannot be evaluated."
+            )
+            caveat = (
+                "This is a data-quality limitation, not evidence of missing interaction. "
+                "The notes exist; their timestamps could not be parsed at read time."
+            )
+        else:
+            summary = "The Notes API returned no notes for this contact."
+            caveat = (
+                "Absence of API-visible notes does not prove no interaction occurred — "
+                "it means the Notes endpoint returned nothing at read time."
+            )
         findings.append(
             {
                 "gap_type": "no_recent_interaction_note",
-                "summary": "The Notes API returned no notes for this contact.",
-                "evidence": {"notes_checked": len(notes)},
-                "caveat": "Absence of API-visible notes does not prove no interaction "
-                "occurred — it means the Notes endpoint returned nothing at read time.",
+                "summary": summary,
+                "evidence": {
+                    "notes_checked": len(notes),
+                    "notes_with_unusable_dates": undateable_notes,
+                    "stale_note_days_threshold": stale_note_days,
+                },
+                "threshold_basis": STALE_NOTE_THRESHOLD_BASIS,
+                "caveat": caveat,
+                "advisory": STALE_NOTE_ADVISORY,
             }
         )
     else:
-        age_days = (now - latest_note["_parsed_created"]).days
+        # Fractional days: a truncating day count would silently let anything
+        # under threshold+1 days pass, making the effective boundary a day
+        # later than the stated threshold.
+        age_days = (now - latest_note["_parsed_created"]).total_seconds() / 86400.0
         if age_days > stale_note_days:
             findings.append(
                 {
                     "gap_type": "no_recent_interaction_note",
-                    "summary": f"Most recent note is {age_days} day(s) old (threshold {stale_note_days}).",
+                    "summary": f"Most recent API-visible note is {age_days:.1f} day(s) old, "
+                    f"beyond the {stale_note_days}-day advisory threshold.",
                     "evidence": {
                         "latest_note_id": latest_note.get("id"),
                         "latest_note_date": latest_note["_parsed_created"].isoformat(),
+                        "latest_note_age_days": round(age_days, 2),
+                        "stale_note_days_threshold": stale_note_days,
                         "notes_checked": len(notes),
+                        "notes_with_unusable_dates": undateable_notes,
                     },
+                    "threshold_basis": STALE_NOTE_THRESHOLD_BASIS,
                     "caveat": "Based only on notes visible via the Notes API at read time; "
                     "not proof no other interaction occurred.",
+                    "advisory": STALE_NOTE_ADVISORY,
                 }
             )
 
     if expected_assigned_user_id is not None:
         actual = person.get("assignedUserId")
-        if actual is not None and int(actual) != int(expected_assigned_user_id):
+        if actual is None:
+            # An unassigned contact must not pass an ownership check silently:
+            # "nobody owns this" is a stronger control gap than "the wrong
+            # person owns this," not an absence of one.
+            findings.append(
+                {
+                    "gap_type": "ownership_mismatch",
+                    "summary": f"Contact has no assigned user; expected user {expected_assigned_user_id}.",
+                    "evidence": {
+                        "assignedUserId": None,
+                        "expected_assigned_user_id": expected_assigned_user_id,
+                    },
+                }
+            )
+        elif int(actual) != int(expected_assigned_user_id):
             findings.append(
                 {
                     "gap_type": "ownership_mismatch",
