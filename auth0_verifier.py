@@ -16,7 +16,8 @@ class Auth0TokenVerifier(TokenVerifier):
         if not domain.startswith("http"):
             domain = f"https://{domain}"
         self.issuer = f"{domain}/"
-        self.audience = os.environ["MCP_PUBLIC_URL"].rstrip("/") + "/mcp"
+        default_audience = os.environ["MCP_PUBLIC_URL"].rstrip("/") + "/mcp"
+        self.audience = os.getenv("AUTH0_AUDIENCE") or default_audience
         self.jwks = PyJWKClient(f"{domain}/.well-known/jwks.json")
 
     async def verify_token(self, token: str) -> AccessToken | None:
