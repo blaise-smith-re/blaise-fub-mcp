@@ -2,6 +2,15 @@
 
 One comprehensive FUB connector bundle so routine capabilities do not require repeated code patches.
 
+## Read-only Real Estate OS pilot endpoint
+
+`readonly_server.py` provides a separately deployable least-privilege surface for live OS certification. It registers
+exactly six read tools, requires only `fub:read`, and contains no write, send, delete, scheduling, or configuration
+tools. See `docs/READONLY_OS_ENDPOINT.md` for deployment and certification requirements.
+
+The endpoint is an activation boundary, not a permanent limit on OS automation. Broader operations move through
+their own certification gates instead of exposing the full write surface during initial live verification.
+
 ## Reads
 Contacts/search, events, notes, calls, texts, tasks, appointments, deals, stages, users,
 timeframes, contact/deal custom fields, pipelines, appointment types/outcomes.
