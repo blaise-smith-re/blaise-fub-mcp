@@ -78,6 +78,10 @@ def test_auth0_verifier_supports_explicit_shared_audience(monkeypatch):
     assert verifier.audience == "https://operator.example/mcp"
 
 
+def test_oauth_discovery_and_verifier_share_the_same_audience():
+    assert readonly_server.RESOURCE_SERVER_URL == readonly_server.Auth0TokenVerifier().audience
+
+
 async def test_exact_contact_and_bounded_history_reads(fake):
     assert (await readonly_server.get_contact(90001))["id"] == 90001
     assert len((await readonly_server.get_contact_events(90001))["events"]) == 1

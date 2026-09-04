@@ -31,6 +31,7 @@ def _public_base() -> str:
 
 
 PUBLIC_BASE = _public_base()
+RESOURCE_SERVER_URL = os.getenv("AUTH0_AUDIENCE") or f"{PUBLIC_BASE}/mcp"
 AUTH0_DOMAIN = os.environ["AUTH0_DOMAIN"].strip().rstrip("/")
 if not AUTH0_DOMAIN.startswith("http"):
     AUTH0_DOMAIN = f"https://{AUTH0_DOMAIN}"
@@ -52,7 +53,10 @@ mcp = FastMCP(
     token_verifier=Auth0TokenVerifier(),
     auth=AuthSettings(
         issuer_url=AnyHttpUrl(f"{AUTH0_DOMAIN}/"),
-        resource_server_url=AnyHttpUrl(f"{PUBLIC_BASE}/mcp"),
+        # OAuth discovery must advertise the same resource identifier that the
+        # token verifier accepts. This may intentionally differ from the
+        # read-only service's transport URL when it reuses an existing Auth0 API.
+        resource_server_url=AnyHttpUrl(RESOURCE_SERVER_URL),
         required_scopes=list(REQUIRED_SCOPES),
     ),
 )
