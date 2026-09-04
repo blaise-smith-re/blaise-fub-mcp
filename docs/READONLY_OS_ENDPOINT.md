@@ -33,7 +33,8 @@ Set these environment variables in the hosting control plane; do not commit thei
 - `FUB_BASE_URL`
 - `MCP_PUBLIC_URL` — the public base URL of the read-only service
 - `AUTH0_DOMAIN`
-- `AUTH0_AUDIENCE` — optional; set this to the existing Auth0 API audience to reuse its access-token audience
+- `AUTH0_AUDIENCE` — optional; set this to the existing Auth0 API audience to reuse its access-token audience. The
+  read-only server advertises this same identifier during OAuth discovery so the issued token and verifier agree.
 
 Authorize the client for `fub:read` only. Never grant `fub:write` to this endpoint.
 
