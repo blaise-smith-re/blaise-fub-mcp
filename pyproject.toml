@@ -14,12 +14,16 @@ dependencies = [
   "PyJWT[crypto]>=2.8",
 ]
 
+[project.scripts]
+fub-oauth-preflight = "oauth_diagnostics:main"
+
 [tool.setuptools]
 py-modules = [
   "server",
   "readonly_server",
   "fub_client",
   "auth0_verifier",
+  "oauth_diagnostics",
   "closeout",
   "daily_control",
   "redaction",

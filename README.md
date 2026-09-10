@@ -2,7 +2,18 @@
 
 One comprehensive FUB connector bundle so routine capabilities do not require repeated code patches.
 
-## Read-only Real Estate OS pilot endpoint
+## Full MCP OAuth recovery
+
+The owner-selected connection is `blaise_fub_full`. See
+[OAuth recovery and future-computer connection](docs/OAUTH-RECOVERY.md) for the
+public native CIMD proposal, registration-sprawl prevention, credential-free
+preflight and exact live acceptance requirements. This proposal is not a claim
+that Auth0 recovery or deployment has completed.
+
+## Historical read-only Real Estate OS pilot endpoint — retired
+
+Retired by owner instruction on 2026-09-10. The following implementation and
+certification history is retained as evidence, not a new-computer setup dependency.
 
 `readonly_server.py` provides a separately deployable least-privilege surface for live OS certification. It registers
 exactly six read tools, requires only `fub:read`, and contains no write, send, delete, scheduling, or configuration
