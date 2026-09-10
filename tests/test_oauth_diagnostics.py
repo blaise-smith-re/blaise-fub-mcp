@@ -37,6 +37,15 @@ def test_cimd_callback_matches_codex_0154_complete_resource_hash():
     assert assess(*documents())["auto_cimd_metadata_ready"] is True
 
 
+def test_oidc_scope_discovery_does_not_replace_required_resource_permissions():
+    prm, metadata, cimd = documents()
+    metadata["scopes_supported"] = ["openid", "profile", "offline_access"]
+    result = assess(prm, metadata, cimd)
+    assert result["authorization_server_scopes_cover_fub"] is False
+    assert result["required_explicit_codex_scopes"] == ["fub:read", "fub:write"]
+    assert result["checks"]["full_scopes_advertised"] is True
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

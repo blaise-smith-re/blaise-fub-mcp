@@ -87,6 +87,10 @@ def assess(prm: dict[str, Any], metadata: dict[str, Any], cimd: dict[str, Any]) 
         "checks": checks,
         "auto_cimd_metadata_ready": all(checks.values()),
         "configured_client_skips_registration": True,
+        # Codex 0.154's discovered AS scopes can differ from this resource's
+        # permissions. Pin resource scopes in the server configuration instead.
+        "required_explicit_codex_scopes": SCOPES.copy(),
+        "authorization_server_scopes_cover_fub": set(SCOPES).issubset(metadata.get("scopes_supported", [])),
         "expected_cimd_client_id": CIMD,
         "expected_loopback_callback_without_port": expected_redirect,
         "dcr_endpoint_present": public_url(metadata.get("registration_endpoint")),

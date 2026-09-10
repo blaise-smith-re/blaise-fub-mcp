@@ -1,129 +1,139 @@
 # Full MCP OAuth recovery and future-computer connection
 
-Status: engineering proposal; live Auth0 recovery is not yet proven. No deployment,
-tenant setting, client registration, business-policy change or FUB write follows
-from this document. Preserve the original full-server tool and write controls.
+Status: login, repeat login, new-process tools and one exact read verified;
+historical Google 401 diagnosis and refresh across expiration remain open. No
+tenant setting, application, Render deployment, business policy or FUB record has
+been changed. Lead Engine PR #6 is untouched. The evidence ledger is
+[OAUTH-INVESTIGATION-2026-09-10.md](OAUTH-INVESTIGATION-2026-09-10.md).
 
-## Architecture
+## Selected architecture
 
-Use one `blaise_fub_full` remote MCP at `https://blaise-fub-mcp.onrender.com/mcp`.
-Auth0 issues audience-bound JWTs; Render validates them and retains all FUB
-credentials. Codex stores its own OAuth credentials locally. A full-server
-`fub:write` scope does not authorize a workflow to write. Lead Engine's existing
-facade remains limited to `find_contact` / `get_contact` on source-backed shortlists.
+Use one `blaise_fub_full` remote MCP. Auth0 issues audience-bound JWTs; Render
+validates them and retains the FUB credentials. Codex stores OAuth credentials
+locally. A `fub:write` scope grants server capability, not workflow authorization.
+Lead Engine retains its exact shortlist-only `find_contact` / `get_contact` facade.
+The owner retired the separate read-only OAuth lane on 2026-09-10; its source,
+tests and historical certification remain preserved.
 
-The separate `blaise_fub_read_only` lane was retired by owner instruction on
-2026-09-10. Its source, tests and earlier certification evidence remain historical;
-do not recreate that Auth0 application or make new computers depend on it.
+Reuse the existing **Blaise Codex FUB MCP public native application**. Codex
+0.154.0 explicitly supports a configured public client ID without a client secret;
+it skips registration entirely. New computers reuse the identity and receive their
+own tokens. This prevents DCR growth without periodic client deletion.
 
-The preferred recovery is one administrator-imported **public native CIMD client**,
-reused across computers. It is not a client-secret scheme. The exact document for
-this MCP URL is:
+```toml
+[mcp_servers.blaise_fub_full]
+url = "https://blaise-fub-mcp.onrender.com/mcp"
+scopes = ["fub:read", "fub:write"]
+# Retain the OS's existing enabled_tools and other server settings.
+
+[mcp_servers.blaise_fub_full.oauth]
+client_id = "zVnhfzFBR7aX6np3JSAXf0Cnohu8fWuH"
+callback_url = "http://127.0.0.1:57185/callback/Msr2-imGFcgW"
+callback_port = 57185
+```
+
+The dashboard verified native type, Google enabled, both full-MCP delegated
+permissions and this exact callback. Both callback URL and listener port must be
+configured. If occupied, identify the process; do not kill unrelated processes or
+randomize the callback. The second existing allowed URI uses port 10230 with the
+same path; switching requires changing both port settings consistently.
+
+Explicit scopes are essential on Codex 0.154.0. A controlled request without them
+selected the generic OIDC discovery scopes and omitted both FUB permissions. It
+was stopped before browser navigation. The corrected request contained exactly
+`fub:read fub:write`, one full-MCP resource value and PKCE S256. This verified scope
+defect is separate from the earlier Google 401, whose precise cause is unresolved.
+Refresh-token issuance is a separate acceptance check; callback success does not
+prove indefinite refresh, and scopes must not be broadened silently.
+The full API currently has Allow Offline Access OFF and an 86,400-second maximum
+access-token lifetime. The proposed next step requires owner approval: enable
+offline access for this existing API, verify the native refresh grant, then add
+`offline_access` and validate renewal. Until then, expect interactive re-login
+when the access credential expires; do not advertise continuous refresh.
+
+## CIMD evaluation
+
+Codex Auto supports CIMD when the authorization server advertises
+`client_id_metadata_document_supported: true`, public token auth `none`, and a
+compatible native loopback callback. Auth0 documents manual CIMD import. The
+public document for this exact resource returned HTTP 200 with native/none,
+authorization-code and refresh-token grants, and matching portless callbacks:
 
 `https://chatgpt.com/oauth/codex/Msr2-imGFcgW/client.json`
 
-Auth0 supports manual CIMD registration. The native document uses PKCE and token
-endpoint authentication `none`. Codex 0.154.0 supports it; its release-tag source
-derives `Msr2-imGFcgW` from the full MCP URL. The document returned HTTP 200 during
-this investigation and advertises native, `none`, authorization code/refresh token
-grants and the matching portless loopback callbacks. Live Auth0 import, grant and
-variable-port acceptance still require verification.
+This tenant's CIMD registration flag is OFF and discovery omits it. DCR is ON.
+Resource Parameter Compatibility Profile is already ON. The application list
+showed five visible rows, including two Codex Generic clients, while the creation
+UI reported the limit of ten applications and SSO integrations. No matching CIMD
+client was visible. These are different counts; do not equate visible apps with
+all quota entities.
 
-After tenant provisioning is verified, pin that **public URL** as
-`mcp_servers.blaise_fub_full.oauth.client_id` in OS config. A configured client ID
-takes precedence and skips client registration, so loss of CIMD advertisement
-cannot silently fall back to DCR and create another application. All machines use
-the same identity; their own OAuth tokens remain separate. The subordinate OS PR
-must remain a proposal until the tenant can resolve this client.
+Reusing the existing native client avoids a new import, capacity change or
+tenant-wide feature change. This does not establish that Auth0 is incompatible
+with CIMD. A future reviewed migration could import the public document, verify
+grants and variable-port callback handling, then pin its public URL. Never fake a
+CIMD flag in resource metadata or add an issuer proxy to imply unsupported behavior.
 
-For unpinned Codex Auto selection, the tenant metadata must advertise both
-`client_id_metadata_document_supported: true` and token auth method `none`, with a
-supported loopback callback. The deployed tenant currently omits the CIMD flag.
-Do not add a fake flag to the Render resource metadata or proxy the issuer. Auth0
-must implement and advertise its own capability.
+## Operator-run procedure
 
-## Tenant setup to review once dashboard access is available
+The operator executes diagnostics and commands; Blaise only completes human
+authentication or approves consequential tenant changes.
 
-1. Inspect existing apps and reuse an already imported matching CIMD, if present.
-   Otherwise review one import of the exact URL above as a native third-party
-   client. Do not create another `Codex Generic` DCR application.
-2. Verify user-delegated access to the existing full MCP API, exact API identifier
-   equal to the MCP URL, and `fub:read` / `fub:write` scope availability. Preserve
-   user restrictions, consent and existing authorization controls. Do not grant
-   machine-to-machine access, wildcard clients, or broad default third-party grants.
-3. Review Auth0's Client ID Metadata Document Registration setting and Resource
-   Parameter Compatibility Profile. The latter consumes RFC 8707 `resource` as
-   audience instead of forwarding it upstream. Public discovery cannot prove its
-   current private value. Review before changing either tenant-wide setting.
-4. Inspect the actual Google social connection and sanitized failed-login details:
-   provider client identity, callback allowlist, enabled connection/app mapping and
-   development-key/custom-key mode. Never reveal or copy a client secret. Changing
-   Google credentials is a human credential-entry operation, not an agent log step.
-5. Verify native loopback port handling against the hosted document. Auth0 must
-   accept the listener's variable port while matching host/path. Do not broaden
-   callbacks with wildcards or disable issuer, PKCE, audience or state checks.
+1. Resolve and verify Codex by absolute path. This Windows machine has 0.154.0 at
+   `%LOCALAPPDATA%/Programs/OpenAI/Codex/bin/codex.exe`; the desktop task inherited
+   bundled 0.153.0. Use the verified executable without replacing the bundled file.
+2. Start from the trusted OS checkout and verify the single full server, pinned
+   public client, exact callback/port, explicit scopes and retained tool allowlist.
+   The OS configuration change is a separate review PR, not Lead Engine PR #6.
+3. Run `python oauth_diagnostics.py`. It issues five bounded public GETs and never
+   reads credentials, registers clients or calls FUB. Exit 1 means Auto CIMD is not
+   ready, not that this configured native client cannot work. Exit 2 is retrieval
+   failure. Inspect explicit-scope advice as well as metadata consistency.
+4. Preserve working credentials. If clean relevant state is necessary, use the
+   supported `codex mcp logout blaise_fub_full` only when ready, then run
+   `codex mcp login blaise_fub_full` once. Capture sanitized request facts only.
+   Never retain raw auth URLs, state, codes, tokens, cookies or secrets. Expired
+   transactions need fresh login, never replay of an old authorization link.
+5. Bring the Google account chooser forward. Auth0 dashboard administration and
+   MCP user sign-in can use different identities; let Blaise select the right
+   account. No browser token extraction or bypass of MFA/provider controls.
+6. Restart a Codex process in the trusted project. Inspect `codex mcp list` plus
+   live MCP initialization/tool enumeration. An `o_auth` label alone is not proof.
+7. Perform one approved exact `find_contact`, limit 3. No stage/geography/CRM scan,
+   writes or new contact. Keep record bodies out of Git and diagnostic reports.
+8. Repeat reconnect and controlled login with the same client. Independently
+   compare Auth0 inventory/logs: no new DCR client, same configured identity.
+   Verify credential persistence and report refresh lifetime limitations honestly.
 
-If this tenant cannot support the native CIMD document, the supported fallback is
-one reusable, pre-registered **public native client** (`none`, PKCE S256) with a
-non-secret client ID in Codex config. Inspect and reuse a suitable existing app;
-review any necessary conversion or new registration first. If fixed callbacks are
-required, register one exact server-specific URI and configure **both** callback URL
-and listener port. Never invent a Codex `client_secret` option. A confidential
-secret-based app is not this fallback. No cleanup scheduler or periodic client deletion.
+## Google 401 evidence boundary
 
-## Operator-run connection procedure
+The generic Google 401 did not identify a malformed parameter. Historical FUB and
+Auth0 dashboard handoffs used different Google clients/callbacks; neither observed
+Google request included `resource`. Tenant logs now verify use of Auth0 Google
+development keys, but that warning does not prove the 401 cause. Auth0 documents
+development keys as test-only with SSO/refresh limitations. Production Google
+credentials require a separately reviewed change and human secret entry; no such
+change has been made. Do not blame account selection, loopback URI, resource or
+development keys as the exact cause without provider evidence.
 
-The operator executes commands; Blaise only completes human authentication or
-approves consequential tenant changes. Do not send him back to PowerShell.
+## Acceptance and checkpoint
 
-1. Resolve the executable and invoke `--version` by absolute path. This machine has
-   0.154.0 at `%LOCALAPPDATA%/Programs/OpenAI/Codex/bin/codex.exe`; the desktop task's
-   inherited PATH initially selected bundled 0.153.0. Do not overwrite the app's
-   bundled binary. Use the verified 0.154.0 path for acceptance checks.
-2. Open the trusted OS checkout. Confirm the full endpoint and expected allowlist;
-   disable the retired read-only entry. Apply the reviewed public-client config only
-   after tenant provisioning. Keep credentials out of Git, Drive, transcripts and screenshots.
-3. Run `python oauth_diagnostics.py` from this repository. It issues only five public
-   GETs: MCP challenge, protected-resource metadata, two Auth0 discovery documents
-   and the public CIMD. Exit 1 means Auto CIMD metadata is not ready; it is not proof
-   the configured public client cannot work. Exit 2 means a bounded retrieval failed.
-   It does not inspect tenant permissions, create applications or prove FUB access.
-4. Preserve working credentials. Only when the operator is ready for the controlled
-   clean-state acceptance, run the supported `codex mcp logout blaise_fub_full`
-   if relevant state must be cleared, then `codex mcp login blaise_fub_full` once.
-   Capture only allowlisted, sanitized request facts; never save a raw auth URL or token.
-   An expired callback needs a fresh transaction, not replay of an old link.
-5. Restart a Codex process in the trusted project. Check `codex mcp list` and actual
-   MCP initialization/tool enumeration. `o_auth` in the list alone is not a live
-   authentication or tool-usability certificate.
-6. Perform one exact `find_contact` read: the approved named target, limit 3. Do not
-   scan stages, geography, the full CRM or create a contact. Record minimal success
-   and match status privately; no CRM body in Git or this diagnostic report.
-7. Repeat restart/reconnect and one controlled login with the same public client;
-   independently compare the Auth0 application inventory before/after. No application
-   growth and unchanged public client identity are required. Also verify credential
-   persistence and refresh behavior; a callback success alone is insufficient.
+Require successful clean login, a new-process live tool inventory, one exact read,
+no application growth on repeat login, and an evidence-based Google diagnosis.
+No callback or test suite alone proves permanent recovery. Record unresolved checks
+in the investigation ledger rather than certifying them.
 
-## Evidence required before calling this fixed
-
-- Exact Google/Auth0 failure cause from provider error/request evidence; distinguish
-  unknowns from verified facts. A generic 401 is not a diagnosis.
-- Successful clean login, separate-process reconnect and expected tool inventory.
-- One exact read, zero FUB writes and no broad discovery.
-- No new client on repeat login, verified by Auth0 readback.
-- Tenant changes, approvals and effective metadata independently read back.
-
-The saved Lead Engine checkpoint is outside this repository and PR #6 is untouched.
-After authentication succeeds it can resume its prepared exact relationship lookup
-without repeating Matrix. This infrastructure task's exact read can satisfy that
-lookup if the same target, board identity and facade rules are reconciled; do not
-claim the saved board was updated unless separately read back.
+The saved Lead Engine checkpoint can resume its prepared Anthony Nguyen lookup
+after authentication is proven without repeating Matrix. This task does not edit
+the checkpoint or board. An exact read can satisfy the pending relationship check
+only after target identity and the existing facade rules are reconciled.
 
 ## Primary references
 
-- [Codex MCP OAuth registration and callbacks](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
-- [Codex 0.154.0 registration implementation](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/rmcp-client/src/oauth_client_registration.rs)
-- [Codex configured-client implementation](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/rmcp-client/src/perform_oauth_login.rs)
+- [Codex 0.154 registration selection](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/rmcp-client/src/oauth_client_registration.rs)
+- [Codex configured-client login](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/rmcp-client/src/perform_oauth_login.rs)
+- [Codex 0.154 CLI scope precedence](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/cli/src/mcp_cmd.rs)
 - [Auth0 manual CIMD registration](https://auth0.com/docs/get-started/auth0-overview/create-applications/register-applications-with-cimd)
-- [Auth0 resource compatibility profile](https://auth0.com/ai/docs/mcp/guides/resource-param-compatibility-profile)
-- [Native loopback redirects, RFC 8252 section 7.3](https://www.rfc-editor.org/rfc/rfc8252#section-7.3)
+- [Auth0 resource compatibility](https://auth0.com/ai/docs/mcp/guides/resource-param-compatibility-profile)
+- [Auth0 development-key limitations](https://auth0.com/docs/authenticate/identity-providers/social-identity-providers/devkeys)
+- [Native loopback redirects](https://www.rfc-editor.org/rfc/rfc8252#section-7.3)
