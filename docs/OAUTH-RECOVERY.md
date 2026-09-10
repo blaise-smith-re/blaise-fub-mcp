@@ -155,4 +155,6 @@ only after target identity and the existing facade rules are reconciled.
 - [Auth0 manual CIMD registration](https://auth0.com/docs/get-started/auth0-overview/create-applications/register-applications-with-cimd)
 - [Auth0 resource compatibility](https://auth0.com/ai/docs/mcp/guides/resource-param-compatibility-profile)
 - [Auth0 development-key limitations](https://auth0.com/docs/authenticate/identity-providers/social-identity-providers/devkeys)
+- [Auth0 refresh rotation and overlap](https://auth0.com/docs/secure/tokens/refresh-tokens/configure-refresh-token-rotation)
+- [Auth0 bounded refresh expiration](https://auth0.com/docs/secure/tokens/refresh-tokens/configure-refresh-token-expiration)
 - [Native loopback redirects](https://www.rfc-editor.org/rfc/rfc8252#section-7.3)
