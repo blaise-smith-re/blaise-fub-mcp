@@ -42,7 +42,7 @@ def test_oidc_scope_discovery_does_not_replace_required_resource_permissions():
     metadata["scopes_supported"] = ["openid", "profile", "offline_access"]
     result = assess(prm, metadata, cimd)
     assert result["authorization_server_scopes_cover_fub"] is False
-    assert result["required_explicit_codex_scopes"] == ["fub:read", "fub:write"]
+    assert result["required_explicit_codex_scopes"] == ["fub:read", "fub:write", "offline_access"]
     assert result["checks"]["full_scopes_advertised"] is True
 
 

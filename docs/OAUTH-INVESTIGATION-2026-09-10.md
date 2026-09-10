@@ -1,11 +1,13 @@
 # OAuth investigation — 2026-09-10
 
-**Current result: full MCP login, repeated login, new-process tool access and one
-exact read verified. Precise historical Google 401 cause remains unresolved.**
+**Current result: full MCP login, rotating refresh issuance/renewal, new-process
+tools and bounded reads verified. Historical Google 401 cause remains unresolved.**
 This is separate infrastructure work. Lead Engine PR #6 and its review package are
 unchanged. Controlled logins reused an existing application; no DCR registration,
-Auth0 application creation, tenant mutation, FUB write, CRM scan or credential-store
-extraction was performed during this investigation.
+Auth0 application creation, FUB write or CRM scan occurred. After explicit owner
+approval, API offline access and native-client refresh settings were changed.
+Credential verification used local encrypted storage in memory; no credential
+value, plaintext backup or browser token was exported or printed.
 
 ## Direct observations
 
@@ -155,14 +157,64 @@ the prior Google 401 or refresh across token expiration. Both successful logins
 used the existing Google connection unchanged. Production development-key removal
 requires a separately reviewed provider configuration change.
 
-The full API settings independently show maximum access-token lifetime 86,400
-seconds and **Allow Offline Access OFF**. The current explicit scope set requests
+Before the owner's refresh approval, the full API settings showed maximum access-token lifetime 86,400
+seconds and **Allow Offline Access OFF**. The earlier explicit scope set requested
 no refresh token. Therefore restart persistence is verified, but renewal beyond
 the token lifetime is not enabled by this patch. The existing native app's
 Authorization Code and Refresh Token grants are already checked; Client
 Credentials is disabled. Owner approval was requested for
 enabling offline access on this existing API and requesting `offline_access` for
-the existing native client. No setting was changed while that approval is pending.
+the existing native client. No setting was changed while that approval was pending.
+
+## Owner-approved refresh recovery and live acceptance
+
+The owner explicitly approved offline access on the existing full API and pinned
+native client, retaining the two FUB scopes and the 24-hour access-token lifetime,
+with bounded rotating refresh tokens. Applied and independently reloaded:
+
+| Setting | Before | After |
+|---|---|---|
+| Full API Allow Offline Access | OFF | ON |
+| Access-token maximum lifetime | 86,400 seconds | 86,400 seconds |
+| Native client refresh rotation | OFF | ON |
+| Idle refresh expiration | Unbounded | 604,800 seconds / 7 days |
+| Maximum refresh expiration | Unbounded | 2,592,000 seconds / 30 days |
+| Rotation overlap | 0 seconds | 5 seconds |
+| Codex explicit scopes | fub:read, fub:write | fub:read, fub:write, offline_access |
+
+Existing authorization-code/refresh grants were already enabled. No other grant,
+API permission, client, secret, MCP endpoint, MRRT or access lifetime was added.
+
+Fresh Codex 0.154 login used the same client, callback and one correct resource,
+PKCE S256, and exactly those three scopes. Auth0 recorded the code exchange at
+**23:04:41.431 UTC**. Local verification confirmed a refresh token was present;
+only booleans, scope names and lifetime numbers were emitted.
+
+The renewal test changed only this FUB connection's local `expires_at` cache
+metadata to due. It acquired the existing connection refresh lock and aggregate
+store lock, retained all credential values/other entries, and kept the store age
+encrypted with its existing OS-keyring key. Atomic replacement retained the
+existing ACL. No plaintext file, backup, token log, server lifetime change or clock
+change was used. The test would restore unchanged cache metadata if renewal failed.
+
+A fresh unmodified Codex 0.154 process performed the actual exchange and persisted
+the rotated credential. Auth0 independently logged **Successful Refresh Token
+exchange at 23:08:58.874 UTC**. Verification found changed access and refresh
+tokens, a future expiry, unchanged client/scopes, a refresh credential still
+present, and the same 86,400-second access-token lifetime. Credential values were
+never printed. This tests actual renewal by forcing local cached expiry; it does
+not claim that 24 hours elapsed or that reuse detection was deliberately tripped.
+
+A subsequent new process loaded all 38 configured tools from the trusted OS
+project. The newly authorized single bounded read (`find_contact`, named target,
+limit 3) succeeded with zero matches. No FUB write or further discovery occurred.
+Application inventory still showed the same five rows and the same client IDs;
+no new application appeared. Google connection credentials remain unchanged.
+
+The durable refresh path is ready for Work review. Historical Google 401 diagnosis
+and replacement of Auth0 Google development keys remain separate limitations;
+neither is represented as resolved by refresh success. Future login is expected
+at idle/maximum refresh expiry, revocation or provider security events.
 
 ## Validation and acceptance ledger
 
@@ -177,9 +229,10 @@ the existing native client. No setting was changed while that approval is pendin
 | Restart / expected live tool inventory | Passed in separate processes; 38 configured tools |
 | One exact `find_contact` read | Passed; zero matches; no further search or write |
 | Repeat login without client growth | Passed; same client, same five visible application rows |
-| Refresh across token expiration | API offline access OFF; approval requested; no change yet |
+| Refresh issuance and renewal | Passed: token present, real exchange, rotated token persisted; local cache-expiry trigger |
 | Historical Google 401 malformed parameter | Not identified; did not recur in successful logins |
-| Tenant settings or Render deployment | Unchanged |
+| Auth0 changes | Approved full-API offline access and native refresh bounds/rotation only |
+| Render deployment / new applications | None |
 | Secrets or FUB writes in validation | None |
 
 Windows test setup required the `tzdata` package because this Python installation

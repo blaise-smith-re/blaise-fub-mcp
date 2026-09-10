@@ -23,6 +23,7 @@ PRM = "https://blaise-fub-mcp.onrender.com/.well-known/oauth-protected-resource/
 CALLBACK_ID = base64.urlsafe_b64encode(hashlib.sha256(RESOURCE.encode()).digest()[:9]).decode()
 CIMD = f"https://chatgpt.com/oauth/codex/{CALLBACK_ID}/client.json"
 SCOPES = ["fub:read", "fub:write"]
+CODEX_SCOPES = [*SCOPES, "offline_access"]
 METADATA_FIELDS = (
     "issuer",
     "authorization_endpoint",
@@ -89,7 +90,7 @@ def assess(prm: dict[str, Any], metadata: dict[str, Any], cimd: dict[str, Any]) 
         "configured_client_skips_registration": True,
         # Codex 0.154's discovered AS scopes can differ from this resource's
         # permissions. Pin resource scopes in the server configuration instead.
-        "required_explicit_codex_scopes": SCOPES.copy(),
+        "required_explicit_codex_scopes": CODEX_SCOPES.copy(),
         "authorization_server_scopes_cover_fub": set(SCOPES).issubset(metadata.get("scopes_supported", [])),
         "expected_cimd_client_id": CIMD,
         "expected_loopback_callback_without_port": expected_redirect,

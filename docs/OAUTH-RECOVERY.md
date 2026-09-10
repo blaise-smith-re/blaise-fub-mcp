@@ -1,9 +1,10 @@
 # Full MCP OAuth recovery and future-computer connection
 
-Status: login, repeat login, new-process tools and one exact read verified;
-historical Google 401 diagnosis and refresh across expiration remain open. No
-tenant setting, application, Render deployment, business policy or FUB record has
-been changed. Lead Engine PR #6 is untouched. The evidence ledger is
+Status: fresh login, refresh issuance/rotation/renewal, new-process tools and a
+bounded read verified. Owner-approved API offline access and native-client refresh
+protection are applied. No application, Render deployment, business policy or FUB
+record was created or changed. Historical Google 401 cause remains unresolved.
+Lead Engine PR #6 is untouched. The evidence ledger is
 [OAUTH-INVESTIGATION-2026-09-10.md](OAUTH-INVESTIGATION-2026-09-10.md).
 
 ## Selected architecture
@@ -23,7 +24,7 @@ own tokens. This prevents DCR growth without periodic client deletion.
 ```toml
 [mcp_servers.blaise_fub_full]
 url = "https://blaise-fub-mcp.onrender.com/mcp"
-scopes = ["fub:read", "fub:write"]
+scopes = ["fub:read", "fub:write", "offline_access"]
 # Retain the OS's existing enabled_tools and other server settings.
 
 [mcp_servers.blaise_fub_full.oauth]
@@ -43,13 +44,24 @@ selected the generic OIDC discovery scopes and omitted both FUB permissions. It
 was stopped before browser navigation. The corrected request contained exactly
 `fub:read fub:write`, one full-MCP resource value and PKCE S256. This verified scope
 defect is separate from the earlier Google 401, whose precise cause is unresolved.
-Refresh-token issuance is a separate acceptance check; callback success does not
-prove indefinite refresh, and scopes must not be broadened silently.
-The full API currently has Allow Offline Access OFF and an 86,400-second maximum
-access-token lifetime. The proposed next step requires owner approval: enable
-offline access for this existing API, verify the native refresh grant, then add
-`offline_access` and validate renewal. Until then, expect interactive re-login
-when the access credential expires; do not advertise continuous refresh.
+The owner subsequently approved adding only `offline_access`. The full API now
+has Allow Offline Access ON, with the same 86,400-second access-token lifetime.
+The existing native client already supported the refresh grant. Rotation is ON,
+idle expiration is 604,800 seconds (7 days), maximum expiration is 2,592,000 seconds
+(30 days), and overlap is 5 seconds for network retries. Reuse detection applies
+outside that narrow overlap. No MRRT, new FUB permission or client secret was added.
+
+Refresh issuance was verified without printing credentials. A controlled local
+cache-expiry test then caused Codex's own OAuth client to exchange the refresh
+token: both access and refresh tokens changed, scopes/client remained the same,
+the new expiry was in the future, and Auth0 recorded the refresh exchange.
+This was a real renewal with local cached expiry made due, not a 24-hour elapsed
+test. Neither the server lifetime, access-token contents nor system clock changed.
+
+Durable authentication is bounded, not permanent immunity from sign-in. Expect
+fresh human login after seven days of refresh inactivity, the thirty-day family
+maximum, revocation or other provider security events. Reuse the same pinned
+client for that login; never create another client to repair expired credentials.
 
 ## CIMD evaluation
 
@@ -104,6 +116,11 @@ authentication or approves consequential tenant changes.
 8. Repeat reconnect and controlled login with the same client. Independently
    compare Auth0 inventory/logs: no new DCR client, same configured identity.
    Verify credential persistence and report refresh lifetime limitations honestly.
+   For renewal acceptance, use a scoped credential-aware operator harness that
+   changes only this connection's cached expiry under Codex's credential/store
+   locks. Retain encrypted storage and ACLs, never write plaintext backups, and
+   let Codex perform the actual exchange and persist the rotated credential.
+   Do not replay a superseded refresh token as a live reuse-detection test.
 
 ## Google 401 evidence boundary
 
@@ -111,17 +128,19 @@ The generic Google 401 did not identify a malformed parameter. Historical FUB an
 Auth0 dashboard handoffs used different Google clients/callbacks; neither observed
 Google request included `resource`. Tenant logs now verify use of Auth0 Google
 development keys, but that warning does not prove the 401 cause. Auth0 documents
-development keys as test-only with SSO/refresh limitations. Production Google
-credentials require a separately reviewed change and human secret entry; no such
-change has been made. Do not blame account selection, loopback URI, resource or
+development keys as test-only with limitations. Production Google credentials
+require a separately reviewed change and human secret entry; no such change has
+been made. Our actual native-client refresh test passed with this connection.
+Do not blame account selection, loopback URI, resource or
 development keys as the exact cause without provider evidence.
 
 ## Acceptance and checkpoint
 
-Require successful clean login, a new-process live tool inventory, one exact read,
-no application growth on repeat login, and an evidence-based Google diagnosis.
-No callback or test suite alone proves permanent recovery. Record unresolved checks
-in the investigation ledger rather than certifying them.
+Fresh login, real renewal with rotation, subsequent process restart, all 38 tools,
+one bounded read and unchanged application inventory passed. This is ready for
+Work review of durable native-client authentication. A claim that the historical
+Google 401's exact malformed parameter was fixed is not supported. The unchanged
+development-key connection is an explicit production-hardening limitation.
 
 The saved Lead Engine checkpoint can resume its prepared Anthony Nguyen lookup
 after authentication is proven without repeating Matrix. This task does not edit
