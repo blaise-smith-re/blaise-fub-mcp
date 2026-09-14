@@ -531,6 +531,12 @@ async def get_deal(deal_id: int) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def get_deal_attachment(attachment_id: int) -> dict[str, Any]:
+    """Read an attachment created by this registered system; other systems' files are not visible."""
+    return await _client().get_deal_attachment(attachment_id)
+
+
+@mcp.tool()
 async def get_stages() -> dict[str, Any]:
     return await _client().get_stages()
 
@@ -1081,10 +1087,18 @@ async def update_contact_deal(
     commission_value: int | None = None,
     agent_commission: int | None = None,
     team_commission: int | None = None,
+    attachment_uri: str | None = None,
+    attachment_file_name: str | None = None,
+    attachment_file_size: int | None = None,
 ) -> dict[str, Any]:
     """Preview/update one exact deal. Commission and splits are dollar amounts, not percentages.
 
     Omitted fields stay unchanged. No delete/archive tool is exposed.
+    To add an executed original in Files, supply attachment_uri (a durable Drive
+    file URL), attachment_file_name and optional attachment_file_size in bytes,
+    without other changes. This links the hosted original; it does not upload bytes
+    to FUB or change Drive sharing. Check for an existing attachment before calling;
+    never blindly retry a failed POST, which might already have created the link.
     """
     assert_no_sensitive_data(new_name, description, field_label="deal")
     before = await _client().get_deal(deal_id)
@@ -1120,6 +1134,68 @@ async def update_contact_deal(
         if bad:
             raise ValueError(f"Unknown deal custom field(s): {bad}")
         payload.update(custom_fields)
+    if any(value is not None for value in (attachment_uri, attachment_file_name, attachment_file_size)):
+        if payload:
+            raise ValueError("Attach a file separately from deal-field changes.")
+        if not attachment_uri or not re.fullmatch(
+            r"https://drive\.google\.com/file/d/[A-Za-z0-9_-]+(?:/view)?", attachment_uri
+        ):
+            raise ValueError("Use a durable canonical Google Drive file URL, without query strings or credentials.")
+        if not attachment_file_name or not attachment_file_name.strip():
+            raise ValueError("attachment_file_name is required.")
+        if (
+            any(ord(c) < 32 for c in attachment_file_name)
+            or "/" in attachment_file_name
+            or "\\" in attachment_file_name
+        ):
+            raise ValueError("Use a file name, not a path or control characters.")
+        assert_no_sensitive_data(attachment_file_name, field_label="attachment file name")
+        attachment_payload: dict[str, Any] = {
+            "dealId": deal_id,
+            "uri": attachment_uri,
+            "fileName": attachment_file_name.strip(),
+        }
+        if attachment_file_size is not None:
+            if type(attachment_file_size) is not int or attachment_file_size < 0:
+                raise ValueError("attachment_file_size must be a nonnegative byte count.")
+            attachment_payload["fileSize"] = attachment_file_size
+        if not execute:
+            return {
+                "status": "PREVIEW_ONLY_NO_WRITE",
+                "attachment_type": "EXTERNAL_FILE_LINK",
+                "proposed": attachment_payload,
+            }
+        _require_write_scope()
+        created = await _client().create_deal_attachment(attachment_payload)
+        attachment_id = created.get("id")
+        if not attachment_id:
+            return {
+                "status": "ATTACHMENT_VERIFICATION_FAILED",
+                "created": created,
+                "reason": "No attachment ID returned. Do not blindly retry.",
+            }
+        verified = await _client().get_deal_attachment(int(attachment_id))
+        attachment_mismatches = {
+            k: {"expected": v, "actual": verified.get(k)} for k, v in attachment_payload.items() if verified.get(k) != v
+        }
+        after = await _client().get_deal(deal_id)
+        # Attachment creation must not change sale terms, commissions or linkage.
+        changed = {
+            k
+            for k in before
+            if k not in {"updated", "updatedAt", "attachments", "dealAttachments", "timeToClose"}
+            and before.get(k) != after.get(k)
+        }
+        return {
+            "status": "ATTACHMENT_VERIFICATION_FAILED"
+            if attachment_mismatches or changed
+            else "ATTACHMENT_CREATED_AND_RE_READ",
+            "attachment_type": "EXTERNAL_FILE_LINK",
+            "created": created,
+            "verified": verified,
+            "mismatches": attachment_mismatches,
+            "unexpected_deal_changes": sorted(changed),
+        }
     if not payload:
         raise ValueError("No deal changes supplied.")
     if not execute:
