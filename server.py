@@ -962,6 +962,45 @@ async def update_contact_appointment(
     return {"status": "WRITE_COMPLETED_AND_RE_READ", "before": current, "after": after}
 
 
+def _deal_person_ids(deal: dict[str, Any]) -> set[int]:
+    """Read FUB's expanded GET shape, retaining legacy peopleIds support."""
+    expanded = deal.get("people")
+    legacy = deal.get("peopleIds")
+
+    def ids(values: list[Any]) -> set[int]:
+        result = set()
+        for value in values:
+            if isinstance(value, dict):
+                value = value.get("id")
+            if isinstance(value, bool) or not str(value).isdigit() or int(value) <= 0:
+                raise ValueError("Invalid deal contact ID in FUB response.")
+            result.add(int(value))
+        return result
+
+    expanded_ids = ids(expanded) if isinstance(expanded, list) else None
+    legacy_ids = ids(legacy) if isinstance(legacy, list) else None
+    if expanded_ids is not None and legacy_ids is not None and expanded_ids != legacy_ids:
+        raise ValueError("Conflicting deal contact links in FUB response.")
+    return expanded_ids if expanded_ids is not None else legacy_ids or set()
+
+
+def _deal_commissions(
+    commission_value: int | None, agent_commission: int | None, team_commission: int | None
+) -> dict[str, int]:
+    """Amounts in dollars, not percentage rates; omitted values stay unchanged."""
+    result = {}
+    for key, value in {
+        "commissionValue": commission_value,
+        "agentCommission": agent_commission,
+        "teamCommission": team_commission,
+    }.items():
+        if value is not None:
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{key} must be a nonnegative whole-dollar amount.")
+            result[key] = value
+    return result
+
+
 @mcp.tool()
 async def create_contact_deal(
     person_id: int,
@@ -979,6 +1018,9 @@ async def create_contact_deal(
     possession_date: str | None = None,
     custom_fields: dict[str, Any] | None = None,
     execute: bool = False,
+    commission_value: int | None = None,
+    agent_commission: int | None = None,
+    team_commission: int | None = None,
 ) -> dict[str, Any]:
     """Preview/create a deal for an exact contact. No empty userIds allowed."""
     assert_no_sensitive_data(deal_name, description, field_label="deal")
@@ -989,6 +1031,7 @@ async def create_contact_deal(
     for uid in user_ids:
         await _client().get_user(uid)
     payload: dict[str, Any] = {"name": deal_name, "stageId": stage_id, "peopleIds": [person_id], "userIds": user_ids}
+    payload.update(_deal_commissions(commission_value, agent_commission, team_commission))
     for k, v in {
         "description": description,
         "price": price,
@@ -1035,15 +1078,23 @@ async def update_contact_deal(
     possession_date: str | None = None,
     custom_fields: dict[str, Any] | None = None,
     execute: bool = False,
+    commission_value: int | None = None,
+    agent_commission: int | None = None,
+    team_commission: int | None = None,
 ) -> dict[str, Any]:
-    """Preview/update one exact deal. No delete/archive tool is exposed."""
+    """Preview/update one exact deal. Commission and splits are dollar amounts, not percentages.
+
+    Omitted fields stay unchanged. No delete/archive tool is exposed.
+    """
     assert_no_sensitive_data(new_name, description, field_label="deal")
     before = await _client().get_deal(deal_id)
+    if before.get("id") != deal_id:
+        raise ValueError("Exact deal ID check failed.")
     if str(before.get("name") or "").casefold().strip() != expected_deal_name.casefold().strip():
         raise ValueError("Stale deal-name check failed.")
-    if expected_person_id not in {int(x) for x in (before.get("peopleIds") or [])}:
+    if expected_person_id not in _deal_person_ids(before):
         raise ValueError("Deal is not linked to the expected contact.")
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = _deal_commissions(commission_value, agent_commission, team_commission)
     for k, v in {
         "name": new_name,
         "stageId": stage_id,
@@ -1059,6 +1110,15 @@ async def update_contact_deal(
         if v is not None:
             payload[k] = v
     if custom_fields:
+        defs = await _client().get_deal_custom_fields()
+        valid = {
+            str(x.get("name"))
+            for x in (defs.get("dealCustomFields") or defs.get("data") or [])
+            if str(x.get("name", "")).startswith("custom")
+        }
+        bad = [key for key in custom_fields if key not in valid]
+        if bad:
+            raise ValueError(f"Unknown deal custom field(s): {bad}")
         payload.update(custom_fields)
     if not payload:
         raise ValueError("No deal changes supplied.")
@@ -1067,6 +1127,19 @@ async def update_contact_deal(
     _require_write_scope()
     await _client().update_deal(deal_id, payload)
     after = await _client().get_deal(deal_id)
+    mismatches: dict[str, Any] = {}
+    for key, expected in payload.items():
+        actual = after.get(key)
+        if key.endswith("Date") and isinstance(actual, str) and isinstance(expected, str):
+            actual, expected = actual[:10], expected[:10]
+        if actual != expected:
+            mismatches[key] = {"expected": expected, "actual": actual}
+    if after.get("id") != deal_id or _deal_person_ids(after) != _deal_person_ids(before):
+        mismatches["identity"] = "Deal ID or contact links changed unexpectedly."
+    if after.get("users") != before.get("users") or after.get("userIds") != before.get("userIds"):
+        mismatches["owners"] = "Deal users changed unexpectedly."
+    if mismatches:
+        return {"status": "WRITE_VERIFICATION_FAILED", "before": before, "after": after, "mismatches": mismatches}
     return {"status": "WRITE_COMPLETED_AND_RE_READ", "before": before, "after": after}
 
 
