@@ -240,6 +240,12 @@ class FUBClient:
     async def update_deal(self, deal_id: int, body: dict[str, Any]) -> dict[str, Any]:
         return await self._put(f"/deals/{deal_id}", body)
 
+    async def create_deal_attachment(self, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._post("/dealAttachments", body)
+
+    async def get_deal_attachment(self, attachment_id: int) -> dict[str, Any]:
+        return await self._get(f"/dealAttachments/{attachment_id}")
+
     # ---------- account/config reads ----------
     async def get_stages(self) -> dict[str, Any]:
         return await self._get("/stages", params={"limit": 100, "sort": "orderWeight"})
