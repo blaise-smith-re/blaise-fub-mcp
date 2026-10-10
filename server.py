@@ -341,8 +341,19 @@ async def find_contact(
     stage: str | None = None,
     assigned_user_id: int | None = None,
     limit: int = 10,
+    next_token: str | None = None,
 ) -> dict[str, Any]:
-    """Search contacts. Read-only."""
+    """Search a bounded contact page. Read-only; at most 25 records per call.
+
+    For another page, pass the previous response's `_metadata.next` as
+    next_token and repeat the same search criteria and limit. Preserve the
+    returned pagination metadata; a page is not proof of complete coverage.
+    Do not follow nextLink URLs or widen the owner/filter scope to paginate.
+    """
+    if not any(value and value.strip() for value in (email, phone, name, stage)) and not (
+        assigned_user_id is not None and assigned_user_id > 0
+    ):
+        raise ValueError("Provide at least one search criterion; a limit or cursor alone is not a scope.")
     return await _client().find_people(
         email=email,
         phone=phone,
@@ -350,17 +361,36 @@ async def find_contact(
         stage=stage,
         assignedUserId=assigned_user_id,
         limit=limit,
+        **({"next": next_token} if next_token else {}),
     )
 
 
 @mcp.tool()
 async def get_contact(person_id: int) -> dict[str, Any]:
-    """Retrieve one contact by exact ID. Read-only."""
+    """Retrieve one exact contact with all available FUB fields. Read-only.
+
+    Includes activity counters (propertiesViewed, propertiesSaved, websiteVisits),
+    lastLeadActivity/lastIdxVisit, custom fields, preferences and contact tags when
+    FUB supplies them. Pair with get_contact_events and recent communications to
+    curate next steps. Counters are not the detailed history or confirmed buyer
+    requirements. Respect contact restrictions such as notext. Do not open
+    buyer-specific auto-login/alert links as a substitute for missing API data.
+    """
     return await _client().get_person(person_id)
 
 
 @mcp.tool()
 async def get_contact_events(person_id: int, limit: int = 50, next_token: str | None = None) -> dict[str, Any]:
+    """Read API-visible property/search/inquiry events for one exact contact.
+
+    Preserve raw property, propertySearch, source and occurred fields. Follow
+    _metadata.next using the same person_id and limit to complete visible pages.
+    FUB explicitly restricts some lead events to its application: even an exhausted
+    API result is NOT proof of complete search history. Compare get_contact activity
+    counters with returned event types and disclose unavailable property-level detail.
+    Never infer no browsing or no outreach from an empty API result. Observed browsing
+    is a signal, not a confirmed requirement or consent to contact.
+    """
     return await _client().get_events(person_id, limit=limit, next_token=next_token)
 
 
