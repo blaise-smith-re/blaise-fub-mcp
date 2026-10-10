@@ -26,6 +26,13 @@ their own certification gates instead of exposing the full write surface during 
 Contacts/search, events, notes, calls, texts, tasks, appointments, deals, stages, users,
 timeframes, contact/deal custom fields, pipelines, appointment types/outcomes.
 
+`find_contact` returns at most 25 records per call. To continue an authorized scoped search,
+repeat the same filters and limit with `next_token` set to the prior response's `_metadata.next`.
+Stop when no next token remains; disclose incomplete coverage if a page fails or a run budget
+is reached. A cursor or limit alone does not authorize a search. The tool preserves the existing
+raw response and metadata, performs one GET per call, and does not automatically sweep the account.
+See the [FUB pagination reference](https://docs.followupboss.com/reference/pagination).
+
 ## Daily control audit (read-only)
 `audit_contact_daily_control` / `audit_contacts_daily_control_batch` inspect specifically
 authorized contacts for evidence-supported control gaps (no future task, overdue tasks,
