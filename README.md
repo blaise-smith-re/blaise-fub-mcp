@@ -1,4 +1,4 @@
-# Blaise FUB MCP v5.1 — Full Operator + Safe CRM Closeout
+# Blaise FUB MCP v5.2 — Full Operator + Communication Coverage
 
 One comprehensive FUB connector bundle so routine capabilities do not require repeated code patches.
 
@@ -25,6 +25,12 @@ their own certification gates instead of exposing the full write surface during 
 ## Reads
 Contacts/search, events, notes, calls, texts, tasks, appointments, deals, stages, users,
 timeframes, contact/deal custom fields, pipelines, appointment types/outcomes.
+
+Text reads now follow bounded exact-person cursor pages and explicitly distinguish readable
+content from FUB-restricted bodies. The separately attributed latest communication field may
+provide useful recent content; it is not full history. Call logs are distinguished from audio
+and personal-text containers. See [Communication coverage](docs/COMMUNICATION_COVERAGE.md).
+These are active-request reads, not a background listener or a new phone integration.
 
 `find_contact` returns at most 25 records per call. To continue an authorized scoped search,
 repeat the same filters and limit with `next_token` set to the prior response's `_metadata.next`.

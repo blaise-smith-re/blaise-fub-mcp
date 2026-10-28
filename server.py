@@ -18,6 +18,7 @@ from closeout import (
     is_vague_task_name,
     summarize_recent_notes,
 )
+from communications import call_coverage, latest_communication, text_coverage
 from daily_control import find_gaps
 from fub_client import FUBClient
 from redaction import assert_no_sensitive_data, redact_for_log
@@ -401,12 +402,48 @@ async def get_contact_notes(person_id: int, limit: int = 50, offset: int = 0) ->
 
 @mcp.tool()
 async def get_contact_calls(person_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-    return await _client().get_calls(person_id, limit=limit, offset=offset)
+    """Read API-visible call logs and entered notes, not audio or verbatim transcripts.
+
+    Preserve pagination. A personal-text entry may use a call container; inspect its
+    note before treating it as a phone conversation. Missing data is not no call.
+    """
+    result = await _client().get_calls(person_id, limit=limit, offset=offset)
+    return {**result, "_coverage": call_coverage(result.get("calls", []))}
 
 
 @mcp.tool()
-async def get_contact_text_messages(person_id: int) -> dict[str, Any]:
-    return await _client().get_text_messages(person_id)
+async def get_contact_text_messages(
+    person_id: int, limit: int = 50, next_token: str | None = None, fetch_all: bool = True, max_pages: int = 5
+) -> dict[str, Any]:
+    """Read bounded exact-person SMS pages with explicit content visibility.
+
+    Existing person-only calls now follow up to five API pages. Optional cursor
+    resumes with the same person/limit; never follow arbitrary nextLink URLs.
+    FUB hides some inbound/outbound bodies from third-party APIs. Exhausting pages
+    does not reveal them or establish no other outreach. Read _coverage and the
+    separately attributed latest_communication field before proposing another touch.
+    That latest field is not a complete thread or guaranteed untruncated message.
+    Gmail originals, attachments and personal-phone evidence are separate sources.
+    No send, credential change, recording fetch, persistence or monitoring occurs.
+    """
+    if person_id <= 0:
+        raise ValueError("A positive exact person_id is required.")
+    client = _client()
+    result = await client.get_text_messages_all(
+        person_id, limit=limit, next_token=next_token, max_pages=max_pages if fetch_all else 1
+    )
+    coverage = text_coverage(result["textmessages"])
+    coverage["connector_feature"] = "communication-coverage-v1"
+    coverage["connector_revision"] = os.getenv("RENDER_GIT_COMMIT", "not-provided")
+    try:
+        latest = latest_communication(await client.get_person(person_id), person_id)
+        result["latest_communication"] = latest
+        coverage["latest_field_status"] = "available" if latest else "not_returned"
+    except Exception as exc:
+        coverage["latest_field_status"] = "unavailable"
+        coverage["latest_field_error"] = type(exc).__name__
+    result["_coverage"] = coverage
+    return result
 
 
 @mcp.tool()

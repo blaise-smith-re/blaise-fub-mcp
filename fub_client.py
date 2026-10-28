@@ -108,8 +108,93 @@ class FUBClient:
     async def log_call(self, body: dict[str, Any]) -> dict[str, Any]:
         return await self._post("/calls", body)
 
-    async def get_text_messages(self, person_id: int) -> dict[str, Any]:
-        return await self._get("/textMessages", params={"personId": person_id})
+    async def get_text_messages(self, person_id: int, limit: int = 50, next_token: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"personId": person_id, "limit": min(max(int(limit), 1), 100)}
+        if next_token:
+            params["next"] = next_token
+        return await self._get("/textMessages", params=params)
+
+    async def get_text_messages_all(
+        self, person_id: int, *, limit: int = 50, next_token: str | None = None, max_pages: int = 5
+    ) -> dict[str, Any]:
+        """Bounded exact-person API paging, never a claim of full communication history."""
+        page_limit = min(max(int(max_pages), 1), 5)
+        cursor = next_token
+        seen_cursors = {cursor} if cursor else set()
+        seen_ids: set[str] = set()
+        messages: list[dict[str, Any]] = []
+        totals: set[int] = set()
+        first: dict[str, Any] | None = None
+        meta: dict[str, Any] = {}
+        pages = 0
+        exhausted = False
+        stop_reason = "page_limit"
+        error: str | None = None
+        for _ in range(page_limit):
+            try:
+                page = await self.get_text_messages(person_id, limit=limit, next_token=cursor)
+                rows = page.get("textmessages")
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    raise ValueError("FUB text-message collection is invalid.")
+            except Exception as exc:
+                if first is None:
+                    raise
+                stop_reason = "page_error"
+                error = (
+                    f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+                )
+                break
+            if first is None:
+                first = page
+            pages += 1
+            meta = page.get("_metadata") or {}
+            total = meta.get("total")
+            if isinstance(total, int) and not isinstance(total, bool):
+                totals.add(total)
+            for row in rows:
+                key = str(row["id"]) if row.get("id") is not None else None
+                if key is None or key not in seen_ids:
+                    messages.append(row)
+                    if key is not None:
+                        seen_ids.add(key)
+            if "next" not in meta:
+                stop_reason = "missing_pagination_metadata"
+                break
+            cursor = meta["next"]
+            if cursor is None:
+                exhausted = True
+                stop_reason = "api_pages_exhausted"
+                break
+            if not isinstance(cursor, str) or not cursor.strip():
+                stop_reason = "invalid_cursor"
+                break
+            if cursor in seen_cursors:
+                stop_reason = "repeated_cursor"
+                break
+            seen_cursors.add(cursor)
+        result = dict(first or {})
+        result["textmessages"] = messages
+        result["_metadata"] = {**meta, "next": cursor}
+        complete = exhausted and len(totals) <= 1
+        if len(totals) > 1:
+            complete = False
+            stop_reason = "total_changed"
+        if complete and next_token is None and totals and len(messages) != next(iter(totals)):
+            complete = False
+            stop_reason = "terminal_count_mismatch"
+        result["_completeness"] = {
+            "returned_count": len(messages),
+            "total_count": next(iter(totals)) if len(totals) == 1 else None,
+            "pages_fetched": pages,
+            "api_pages_exhausted": exhausted,
+            "complete": complete,
+            "started_at_beginning": next_token is None,
+            "stop_reason": stop_reason,
+            "resume_next_token": cursor,
+            "error": error,
+            "scope": "API-visible records only; never full SMS, email, personal-phone or app-only history",
+        }
+        return result
 
     async def log_text_message(self, body: dict[str, Any]) -> dict[str, Any]:
         return await self._post("/textMessages", body)

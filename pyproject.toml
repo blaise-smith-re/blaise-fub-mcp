@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blaise-fub-mcp"
-version = "5.1.0"
+version = "5.2.0"
 description = "Private Follow Up Boss MCP operator for Blaise Smith"
 requires-python = ">=3.11"
 dependencies = [
@@ -25,6 +25,7 @@ py-modules = [
   "auth0_verifier",
   "oauth_diagnostics",
   "closeout",
+  "communications",
   "daily_control",
   "redaction",
   "task_dates",
