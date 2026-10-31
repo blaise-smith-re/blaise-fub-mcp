@@ -2,6 +2,13 @@
 
 One comprehensive FUB connector bundle so routine capabilities do not require repeated code patches.
 
+## Render memory recovery
+
+Python is pinned in `.python-version`; the FUB transport reuses one verified TLS
+trust store while continuing to close each request client. See the
+[October 31 memory incident and verification record](docs/CONNECTOR_AUDIT.md#2026-10-31-render-memory-incident)
+for the evidence, loopback probe and production verification limits.
+
 ## Full MCP OAuth recovery
 
 The owner-selected connection is `blaise_fub_full`. See
