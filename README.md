@@ -2,6 +2,29 @@
 
 One comprehensive FUB connector bundle so routine capabilities do not require repeated code patches.
 
+## Enforced user-33 record scope
+
+The shared FUB client enforces Blaise's fixed user ID 33 for every exposed
+contact and related-record request. Searches inject the owner filter and
+validate returned records; direct IDs do not bypass authorization. Tasks must
+also belong to user 33, and deals/appointments must include user 33 and link
+only to assigned contacts. Missing, conflicting or out-of-scope ownership
+fails closed. Account configuration remains readable but cannot be mutated.
+
+Before each mutation, the boundary rereads current ownership. Contact/lender
+reassignment and changed deal/appointment ownership or contact links are
+blocked. Read checks are reused only within a single collection page, never
+across calls or writes. FUB does not provide an atomic ownership-conditioned
+write here: a concurrent upstream reassignment between the final check and
+write cannot be eliminated by this connector. Existing independent readback
+and uncertain-write reconciliation remain required.
+
+Mixed-owner upstream pages are filtered without returning excluded records;
+task pagination continues using raw page sizes, with scoped completeness.
+The regression suite exercises the real transport boundary using synthetic
+offline records. OAuth, credentials, endpoint URLs and MCP tool signatures
+are unchanged. No additional server or recurring task is introduced.
+
 ## Render memory recovery
 
 Python is pinned in `.python-version`; the FUB transport reuses one verified TLS

@@ -8,6 +8,8 @@ from typing import Any
 import certifi
 import httpx
 
+from ownership import OwnershipBoundary
+
 
 @lru_cache(maxsize=1)
 def _tls_context() -> ssl.SSLContext:
@@ -41,6 +43,16 @@ class FUBClient:
         }
 
     async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await OwnershipBoundary(self._raw_request).request(method, path, params=params, json_body=json_body)
+
+    async def _raw_request(
         self,
         method: str,
         path: str,
@@ -256,11 +268,15 @@ class FUBClient:
         total: int | None = None
         pages = 0
         capped = False
+        scope_filtered = False
 
         while True:
             response = await self.search_tasks(**clean, limit=limit, offset=offset)
             page_items = list(response.get("tasks") or response.get("data") or [])
             meta = response.get("_metadata") or {}
+            scope = response.get("_scope") or {}
+            scope_filtered = scope_filtered or bool(scope.get("filtered"))
+            raw_count = scope.get("raw_page_count", len(page_items))
             if isinstance(meta.get("total"), int):
                 total = meta["total"]
             pages += 1
@@ -278,9 +294,9 @@ class FUBClient:
             if len(collected) >= max_items:
                 capped = True
                 break
-            if not page_items or len(page_items) < limit:
+            if raw_count < limit:
                 break
-            if new_this_page == 0:
+            if new_this_page == 0 and not scope.get("filtered"):
                 # A full page with nothing new: stop rather than loop forever
                 # against a misbehaving or shifting result set.
                 break
@@ -291,10 +307,11 @@ class FUBClient:
 
         completeness = {
             "returned_count": len(collected),
-            "total_count": total,
-            "has_more": bool(capped or (isinstance(total, int) and total > len(collected))),
+            "total_count": None if scope_filtered else total,
+            "has_more": bool(capped or (not scope_filtered and isinstance(total, int) and total > len(collected))),
             "capped": capped,
             "pages_fetched": pages,
+            "scope": "user-33 tasks on user-33 contacts",
         }
         return collected, completeness
 

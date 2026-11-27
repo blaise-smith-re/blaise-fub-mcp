@@ -151,6 +151,10 @@ def _page_completeness(
     """Completeness metadata for a single (non-paginated) page of results."""
     total = (response.get("_metadata") or {}).get("total")
     has_more = isinstance(total, int) and (offset + len(items)) < total
+    scope = response.get("_scope") or {}
+    if scope.get("filtered"):
+        total = None
+        has_more = scope.get("raw_page_count", 0) >= limit
     return {
         "returned_count": len(items),
         "total_count": total if isinstance(total, int) else None,
